@@ -120,6 +120,35 @@ describe("RepoBoard Durable Object", () => {
     expect(history.tasks[0].archivedAt).not.toBeNull();
   });
 
+  it("atomically saves an explicitly approved plan and replaces planning with implementation", async () => {
+    const stub = await freshBoard("plan-and-start");
+    let view = unwrap(await command(stub, zac, 0, { type: "create_task", title: "Plan and build", description: "Continue without a second turn" }));
+    const taskId = view.tasks[0].id;
+    view = unwrap(await command(stub, zac, 1, { type: "claim_task", taskId, kind: "planning", agentLabel: "Primary Codex thread" }));
+    const planningId = view.tasks[0].assignment!.id;
+
+    view = unwrap(await command(stub, zac, 2, { type: "set_plan_and_start_work", assignmentId: planningId, markdown: "1. Implement\n2. Verify" }));
+
+    expect(view.tasks[0]).toMatchObject({
+      column: "in_progress",
+      plan: { revision: 1, markdown: "1. Implement\n2. Verify", delegatedApproval: true },
+      assignment: {
+        kind: "implementation",
+        userLogin: "zac",
+        agentLabel: "Primary Codex thread",
+        phase: "implementing",
+        summary: "Implementation started",
+        isMine: true,
+      },
+    });
+    expect(view.tasks[0].assignment?.id).not.toBe(planningId);
+    expect(view.tasks[0].recentEvents.map((event) => event.type)).toEqual(expect.arrayContaining(["plan_set", "work_started"]));
+
+    const formerMutation = await command(stub, zac, 3, { type: "report_progress", assignmentId: planningId, phase: "planning", summary: "Old lease", stats: {} });
+    expect(formerMutation.ok).toBe(false);
+    if (!formerMutation.ok) expect(formerMutation.error.code).toBe("assignment_inactive");
+  });
+
   it("returns closed-unmerged work to In Progress and rejects invalid archival", async () => {
     const stub = await freshBoard("rollback");
     let view = unwrap(await command(stub, zac, 0, { type: "create_task", title: "Rollback", description: "PR can close" }));

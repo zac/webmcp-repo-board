@@ -107,7 +107,7 @@ describe("dynamic WebMCP profiles", () => {
   });
 
   it.each([
-    ["todo", ["list_tasks", "inspect_task", "report_progress", "release_task", "set_plan"]],
+    ["todo", ["list_tasks", "inspect_task", "report_progress", "release_task", "set_plan", "set_plan_and_start_work"]],
     ["ready", ["list_tasks", "inspect_task", "report_progress", "release_task", "read_plan", "update_plan", "start_work"]],
     ["in_progress", ["list_tasks", "inspect_task", "report_progress", "release_task", "read_plan", "link_pull_request"]],
     ["in_pr", ["list_tasks", "inspect_task", "report_progress", "release_task", "read_pull_request", "read_review", "check_status"]],
@@ -160,6 +160,28 @@ describe("dynamic WebMCP profiles", () => {
     const claim = registry.tools.get("claim_task")!;
     const executionController = new AbortController();
     await expect(claim.execute({ taskId: "task-todo", kind: "planning", agentLabel: "Codex" }, { signal: executionController.signal })).resolves.toContain('"status":"claimed"');
+  });
+
+  it("sets a plan and starts work through one explicit assignment-scoped call", async () => {
+    const registry = new Registry();
+    const boardValue = board(task("todo", true));
+    const nextBoard = board({
+      ...task("in_progress", true),
+      id: "task-todo",
+      assignment: { ...task("in_progress", true).assignment!, id: "implementation-assignment" },
+    });
+    const toolHandlers = handlers(boardValue);
+    toolHandlers.runCommand = vi.fn(async () => nextBoard);
+    await registerBoardTools(registry, toolHandlers, new AbortController().signal);
+
+    const result = await registry.tools.get("set_plan_and_start_work")!.execute({ markdown: "1. Build\n2. Test" });
+
+    expect(toolHandlers.runCommand).toHaveBeenCalledWith(
+      { type: "set_plan_and_start_work", assignmentId: "assignment-todo", markdown: "1. Build\n2. Test" },
+      expect.any(AbortSignal),
+    );
+    expect(result).toContain('"status":"in_progress"');
+    expect(result).toContain('"implementation-assignment"');
   });
 
   it("marks user and GitHub content as untrusted in read results", async () => {

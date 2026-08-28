@@ -150,6 +150,7 @@ export type BoardCommand =
   | { type: "renew_assignment"; assignmentId: string }
   | { type: "report_progress"; assignmentId: string; phase: AgentPhase; summary: string; stats: AgentStats }
   | { type: "set_plan"; assignmentId: string; markdown: string }
+  | { type: "set_plan_and_start_work"; assignmentId: string; markdown: string }
   | { type: "update_plan"; assignmentId: string; markdown: string }
   | { type: "start_work"; assignmentId: string }
   | { type: "release_task"; assignmentId: string }

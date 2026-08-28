@@ -189,10 +189,32 @@ async function addAssignmentTools(
     await add({
       name: "set_plan",
       title: "Set the delegated plan",
-      description: "Attach an immutable Markdown plan revision and move this Todo task to Ready. The human delegated approval by starting this planning assignment.",
+      description: "Before presenting a final plan, attach its exact Markdown as an immutable revision and move this Todo task to Ready. Use this when the human should review or approve implementation separately. The planning assignment then ends.",
       inputSchema: { type: "object", additionalProperties: false, properties: { markdown: { type: "string", minLength: 1, maxLength: 20_000 } }, required: ["markdown"] },
       annotations: { readOnlyHint: false, destructiveHint: false, untrustedContentHint: true },
-      execute: async (input, execution) => bounded({ status: "ready", revision: (await handlers.runCommand({ type: "set_plan", assignmentId, markdown: String(input.markdown) }, toolSignal(execution, registrySignal))).revision }),
+      execute: async (input, execution) => bounded({
+        status: "ready",
+        revision: (await handlers.runCommand({ type: "set_plan", assignmentId, markdown: String(input.markdown) }, toolSignal(execution, registrySignal))).revision,
+        next: "When the human approves implementation, claim this Ready task with kind implementation and call start_work before editing files.",
+      }),
+    });
+    await add({
+      name: "set_plan_and_start_work",
+      title: "Set the plan and start implementation",
+      description: "Use only when the human explicitly asked to implement the finalized plan now. Atomically save the exact Markdown plan, complete planning, create this tab's implementation assignment, and move the task to In Progress before editing files.",
+      inputSchema: { type: "object", additionalProperties: false, properties: { markdown: { type: "string", minLength: 1, maxLength: 20_000 } }, required: ["markdown"] },
+      annotations: { readOnlyHint: false, destructiveHint: false, untrustedContentHint: true },
+      execute: async (input, execution) => {
+        const next = await handlers.runCommand({ type: "set_plan_and_start_work", assignmentId, markdown: String(input.markdown) }, toolSignal(execution, registrySignal));
+        const current = next.tasks.find((candidate) => candidate.id === task.id);
+        return bounded({
+          status: "in_progress",
+          revision: next.revision,
+          task: current ? taskSummary(current) : null,
+          assignment: current?.assignment ?? null,
+          next: "Begin implementation from the stored plan and report progress at meaningful milestones.",
+        });
+      },
     });
   }
 

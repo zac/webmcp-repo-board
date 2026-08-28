@@ -424,6 +424,30 @@ export class RepoBoard extends DurableObject<Env> {
         this.ctx.storage.sql.exec("UPDATE assignments SET status = 'completed', last_activity_at = ? WHERE id = ?", now, assignment.id);
         return { type: "plan_set", taskId: task.id, data: { planRevision, column: "ready" } };
       }
+      case "set_plan_and_start_work": {
+        const planningAssignment = this.requireAssignment(command.assignmentId, actor, now, "planning");
+        const task = this.requireTask(planningAssignment.task_id);
+        if (task.column_name !== "todo") throw new BoardError("invalid_transition", "A plan can only be set and started on a Todo task", 409);
+        const planRevision = task.latest_plan_revision + 1;
+        const implementationAssignmentId = crypto.randomUUID();
+        this.insertPlan(task.id, planRevision, command.markdown, actor, now);
+        this.ctx.storage.sql.exec("UPDATE assignments SET status = 'completed', last_activity_at = ? WHERE id = ?", now, planningAssignment.id);
+        this.ctx.storage.sql.exec(
+          `INSERT INTO assignments (id, task_id, kind, user_id, user_login, agent_label, status, claimed_at, last_activity_at, lease_expires_at, phase, summary, stats_json)
+           VALUES (?, ?, 'implementation', ?, ?, ?, 'active', ?, ?, ?, 'implementing', 'Implementation started', '{}')`,
+          implementationAssignmentId,
+          task.id,
+          actor.userId,
+          actor.login,
+          planningAssignment.agent_label,
+          now,
+          now,
+          now + LEASE_MS,
+        );
+        this.ctx.storage.sql.exec("UPDATE tasks SET column_name = 'in_progress', latest_plan_revision = ?, updated_at = ?, task_revision = ? WHERE id = ?", planRevision, now, revision, task.id);
+        this.insertEvent(revision, "plan_set", task.id, actor.login, now, { planRevision, column: "ready" });
+        return { type: "work_started", taskId: task.id, data: { assignmentId: implementationAssignmentId, planRevision, column: "in_progress" } };
+      }
       case "update_plan": {
         const assignment = this.requireAssignment(command.assignmentId, actor, now, "implementation");
         const task = this.requireTask(assignment.task_id);

@@ -29,6 +29,7 @@ export function parseCommandEnvelope(value: unknown): CommandEnvelope {
       command = { type, assignmentId: identifier(commandObject.assignmentId, "assignmentId"), phase: enumValue(commandObject.phase, AGENT_PHASES, "phase"), summary: boundedString(commandObject.summary, "summary", 1, 500), stats: parseStats(commandObject.stats) };
       break;
     case "set_plan":
+    case "set_plan_and_start_work":
     case "update_plan":
       command = { type, assignmentId: identifier(commandObject.assignmentId, "assignmentId"), markdown: boundedString(commandObject.markdown, "markdown", 1, 20_000) };
       break;

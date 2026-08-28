@@ -170,12 +170,19 @@ export function App(): ReactNode {
   const runCommand = useCallback(async (command: BoardCommand, signal?: AbortSignal): Promise<BoardView> => {
     const current = boardRef.current;
     if (!current) throw new Error("No board is open");
+    const assignedTaskId = "assignmentId" in command
+      ? current.tasks.find((task) => task.assignment?.id === command.assignmentId)?.id ?? null
+      : null;
     try {
       const next = await executeCommand(current, command, signal);
       setCurrentBoard(next);
       if (command.type === "claim_task") {
         const assignment = next.tasks.find((task) => task.id === command.taskId)?.assignment;
         if (assignment?.isMine) setActiveAssignmentId(assignment.id);
+      }
+      if (command.type === "set_plan_and_start_work" && assignedTaskId) {
+        const assignment = next.tasks.find((task) => task.id === assignedTaskId)?.assignment;
+        if (assignment?.isMine && assignment.kind === "implementation") setActiveAssignmentId(assignment.id);
       }
       if (["release_task", "set_plan"].includes(command.type)) setActiveAssignmentId(null);
       return next;
@@ -712,7 +719,7 @@ function assignmentStorageKey(boardId: string): string { return `repo-board:${bo
 function codexPrompt(board: BoardView, task: TaskView, kind: "planning" | "implementation"): string {
   const url = new URL(`/boards/${encodeURIComponent(board.owner)}/${encodeURIComponent(board.repo)}`, window.location.href).toString();
   const next = kind === "planning"
-    ? "Call claim_task with kind planning, inspect_task, investigate the repository, then call set_plan with the final delegated plan."
+    ? "Call claim_task with kind planning, inspect_task, and investigate the repository. In Codex Plan Mode, call set_plan with the exact final Markdown before ending the planning turn. After the human selects implement, claim the Ready task with kind implementation and call start_work before editing files. If the human explicitly asks you to implement now in normal mode, call set_plan_and_start_work instead, then begin implementation."
     : task.column === "ready"
       ? "Call claim_task with kind implementation, inspect_task and read_plan, update the plan only if needed, then call start_work before changing code. Report progress at meaningful milestones and link_pull_request when the open PR exists."
       : "Call claim_task with kind implementation, inspect_task, report progress at meaningful milestones, and continue the existing implementation or pull-request follow-up using the tools the board exposes.";
