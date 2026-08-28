@@ -1,0 +1,46 @@
+{
+  "name": "webmcp-repo-board",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.x",
+    "pnpm": "11.x"
+  },
+  "scripts": {
+    "dev": "vite",
+    "dev:worker": "pnpm build && wrangler dev",
+    "build": "tsc -b && vite build",
+    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm test:worker && pnpm build",
+    "deploy": "pnpm build && wrangler deploy",
+    "deploy:dry": "pnpm build && wrangler deploy --dry-run",
+    "d1:migrate:local": "wrangler d1 migrations apply repo-board-directory --local",
+    "d1:migrate:remote": "wrangler d1 migrations apply repo-board-directory --remote",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:worker": "vitest run --config vitest.worker.config.ts",
+    "test:watch": "vitest",
+    "typecheck": "tsc -b --pretty false",
+    "types": "wrangler types --include-runtime false"
+  },
+  "dependencies": {
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.1.1",
+    "@cloudflare/workers-types": "5.20260828.1",
+    "@eslint/js": "10.0.1",
+    "@types/node": "26.4.0",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.5",
+    "@vitejs/plugin-react": "6.1.1",
+    "eslint": "10.9.1",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.68.0",
+    "vite": "8.2.2",
+    "vitest": "4.1.11",
+    "wrangler": "4.127.0"
+  },
+  "packageManager": "pnpm@11.13.1"
+}

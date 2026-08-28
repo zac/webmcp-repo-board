@@ -1,0 +1,13 @@
+.DS_Store
+node_modules/
+.pnpm-store/
+dist/
+coverage/
+.wrangler/
+.dev.vars
+.env
+.env.*
+!.env.example
+*.tsbuildinfo
+playwright-report/
+test-results/

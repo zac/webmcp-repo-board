@@ -1,0 +1,7 @@
+# Repo Board local development does not require GitHub credentials.
+# If you exercise GitHub OAuth or webhooks locally, copy this file to .dev.vars
+# and populate values without committing it.
+GITHUB_APP_ID=""
+GITHUB_APP_PRIVATE_KEY=""
+GITHUB_APP_CLIENT_SECRET=""
+GITHUB_WEBHOOK_SECRET=""

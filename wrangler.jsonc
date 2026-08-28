@@ -1,0 +1,47 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "webmcp-repo-board",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-08-28",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/auth/*", "/webhooks/*"]
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "REPO_BOARD",
+        "class_name": "RepoBoard"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["RepoBoard"]
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DIRECTORY",
+      "database_name": "repo-board-directory",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+  "vars": {
+    "ENVIRONMENT": "production",
+    "GITHUB_APP_CLIENT_ID": "replace-with-client-id",
+    "GITHUB_APP_SLUG": "replace-with-app-slug"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}
