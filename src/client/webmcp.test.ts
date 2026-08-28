@@ -21,8 +21,11 @@ function pullRequest(): PullRequestSnapshot {
     draft: false,
     merged: false,
     headSha: "abc123",
+    baseRef: "main",
     approvals: 1,
     changesRequestedBy: [],
+    reviewRequirement: { requiredApprovals: 2, decision: "review_required", codeOwnerReviewRequired: true, latestPushApprovalRequired: false },
+    mergeState: "blocked",
     reviewCommentCount: 2,
     conversationCommentCount: 1,
     checks: { passed: 2, failed: 0, pending: 1, failedNames: [], pendingNames: ["integration"] },
@@ -39,6 +42,9 @@ function task(column: TaskColumn, assigned = false): TaskView {
     description: "Untrusted ticket text",
     column,
     archivedAt: null,
+    resolution: column === "done" ? "completed" : null,
+    resolutionReason: null,
+    resolvedAt: column === "done" ? 2 : null,
     createdBy: "zac",
     createdAt: 1,
     updatedAt: 2,
@@ -89,6 +95,7 @@ function handlers(boardValue: BoardView, selected = boardValue.tasks[0]?.id ?? n
     runCommand: vi.fn(async () => boardValue),
     refreshPullRequest: vi.fn(async () => boardValue),
     confirmArchive: vi.fn(async () => undefined),
+    confirmCancel: vi.fn(async (_task, reason) => reason),
   };
 }
 
@@ -108,13 +115,13 @@ describe("dynamic WebMCP profiles", () => {
   });
 
   it("exposes claiming to authorized unassigned viewers", async () => {
-    expect(await namesFor(board(task("ready")))).toEqual(["list_tasks", "inspect_task", "claim_task"]);
+    expect(await namesFor(board(task("ready")))).toEqual(["list_tasks", "inspect_task", "cancel_task", "claim_task"]);
   });
 
   it.each([
-    ["todo", ["list_tasks", "inspect_task", "report_progress", "release_task", "set_plan", "set_plan_and_start_work"]],
-    ["ready", ["list_tasks", "inspect_task", "report_progress", "release_task", "read_plan", "update_plan", "start_work"]],
-    ["in_progress", ["list_tasks", "inspect_task", "report_progress", "release_task", "read_plan", "link_pull_request"]],
+    ["todo", ["list_tasks", "inspect_task", "cancel_task", "report_progress", "release_task", "set_plan", "set_plan_and_start_work"]],
+    ["ready", ["list_tasks", "inspect_task", "cancel_task", "report_progress", "release_task", "read_plan", "update_plan", "start_work"]],
+    ["in_progress", ["list_tasks", "inspect_task", "cancel_task", "report_progress", "release_task", "read_plan", "link_pull_request"]],
     ["in_pr", ["list_tasks", "inspect_task", "report_progress", "release_task", "read_pull_request", "read_review", "check_status"]],
   ] satisfies Array<[TaskColumn, string[]]>)("registers the exact %s assignment profile", async (column, expected) => {
     expect(await namesFor(board(task(column, true)))).toEqual(expected);
@@ -141,6 +148,19 @@ describe("dynamic WebMCP profiles", () => {
     await registry.tools.get("archive_task")!.execute({});
     expect(toolHandlers.confirmArchive).toHaveBeenCalledOnce();
     expect(toolHandlers.runCommand).toHaveBeenCalledWith({ type: "archive_task", taskId: "task-done" }, expect.any(AbortSignal));
+  });
+
+  it("requires a human-confirmed reason before cancellation", async () => {
+    const registry = new Registry();
+    const boardValue = board(task("in_progress", true));
+    const toolHandlers = handlers(boardValue);
+    await registerBoardTools(registry, toolHandlers, new AbortController().signal);
+    await registry.tools.get("cancel_task")!.execute({ reason: "Superseded by a smaller change" });
+    expect(toolHandlers.confirmCancel).toHaveBeenCalledWith(boardValue.tasks[0], "Superseded by a smaller change", expect.any(AbortSignal));
+    expect(toolHandlers.runCommand).toHaveBeenCalledWith(
+      { type: "cancel_task", taskId: "task-in_progress", reason: "Superseded by a smaller change" },
+      expect.any(AbortSignal),
+    );
   });
 
   it("cancels registration before any stale profile tool is added", async () => {

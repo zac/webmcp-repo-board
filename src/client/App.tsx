@@ -4,6 +4,7 @@ import {
   type BoardCommand,
   type BoardSummary,
   type BoardView,
+  type PullRequestSnapshot,
   type TaskColumn,
   type TaskView,
 } from "../shared";
@@ -37,6 +38,13 @@ interface ArchiveRequest {
   reject: (reason?: unknown) => void;
 }
 
+interface CancelRequest {
+  task: TaskView;
+  suggestedReason: string;
+  resolve: (reason: string) => void;
+  reject: (reason?: unknown) => void;
+}
+
 export function App(): ReactNode {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [user, setUser] = useState<SessionUser | null>(null);
@@ -55,6 +63,9 @@ export function App(): ReactNode {
   const [toast, setToast] = useState<string | null>(null);
   const [taskEditor, setTaskEditor] = useState<TaskView | "new" | null>(null);
   const [archiveRequest, setArchiveRequest] = useState<ArchiveRequest | null>(null);
+  const [cancelRequest, setCancelRequest] = useState<CancelRequest | null>(null);
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const [archivedTasks, setArchivedTasks] = useState<TaskView[]>([]);
   const [registrationProfileKey, setRegistrationProfileKey] = useState("none");
   const toolRegistrationQueue = useRef<Promise<void>>(Promise.resolve());
   const toolProfileKey = useMemo(() => {
@@ -68,6 +79,8 @@ export function App(): ReactNode {
       viewer: board.viewer.userId,
       canMutate: board.viewer.canMutate,
       selectedTaskId,
+      selectedColumn: selected?.column ?? null,
+      selectedArchived: selected?.archivedAt !== null,
       selectedDone: selected?.column === "done" && selected.archivedAt === null,
       activeAssignmentId,
       activeColumn: active?.column ?? null,
@@ -194,7 +207,10 @@ export function App(): ReactNode {
         const assignment = next.tasks.find((task) => task.id === assignedTaskId)?.assignment;
         if (assignment?.isMine && assignment.kind === "implementation") setActiveAssignmentId(assignment.id);
       }
-      if (["release_task", "set_plan"].includes(command.type)) setActiveAssignmentId(null);
+      if (["release_task", "set_plan"].includes(command.type)
+        || (command.type === "cancel_task" && current.tasks.find((task) => task.id === command.taskId)?.assignment?.id === activeAssignmentRef.current)) {
+        setActiveAssignmentId(null);
+      }
       return next;
     } catch (caught) {
       if (caught instanceof ApiError && caught.code === "stale_revision") await reloadBoard(signal);
@@ -218,6 +234,22 @@ export function App(): ReactNode {
       reject(signal.reason);
     }, { once: true });
   }), []);
+
+  const confirmCancel = useCallback((task: TaskView, suggestedReason: string, signal: AbortSignal): Promise<string> => new Promise((resolve, reject) => {
+    const request: CancelRequest = { task, suggestedReason, resolve, reject };
+    setCancelRequest(request);
+    signal.addEventListener("abort", () => {
+      setCancelRequest((current) => current === request ? null : current);
+      reject(signal.reason);
+    }, { once: true });
+  }), []);
+
+  const loadArchive = useCallback(async (signal?: AbortSignal): Promise<void> => {
+    const current = boardRef.current;
+    if (!current) return;
+    const history = await getBoard(current.owner, current.repo, true, signal);
+    setArchivedTasks(history.tasks.filter((task) => task.archivedAt !== null).sort((a, b) => (b.archivedAt ?? 0) - (a.archivedAt ?? 0)));
+  }, []);
 
   useEffect(() => {
     if (!board) {
@@ -286,13 +318,14 @@ export function App(): ReactNode {
         runCommand: (command, signal) => runCommand(command, signal),
         refreshPullRequest: (taskId, signal) => refreshPr(taskId, signal),
         confirmArchive,
+        confirmCancel,
       }, controller.signal);
       if (!controller.signal.aborted) setToolNames(names);
     }).catch((caught: unknown) => {
       if (!controller.signal.aborted) setError(messageFor(caught));
     });
     return () => controller.abort();
-  }, [confirmArchive, loadTask, refreshPr, registrationProfileKey, runCommand]);
+  }, [confirmArchive, confirmCancel, loadTask, refreshPr, registrationProfileKey, runCommand]);
 
   useEffect(() => {
     if (!board?.tasks.some((task) => task.column === "in_pr")) return;
@@ -356,9 +389,19 @@ export function App(): ReactNode {
           activeAssignmentId={activeAssignmentId}
           realtime={realtime}
           toolNames={toolNames}
+          archiveOpen={archiveOpen}
+          archivedTasks={archivedTasks}
           onBack={navigateHome}
           onSelect={setSelected}
           onNewTask={() => setTaskEditor("new")}
+          onToggleArchive={async () => {
+            const nextOpen = !archiveOpen;
+            setArchiveOpen(nextOpen);
+            if (nextOpen) {
+              try { await loadArchive(); }
+              catch (caught) { setError(messageFor(caught)); }
+            }
+          }}
           onEditTask={(task) => setTaskEditor(task)}
           onPinAssignment={(id) => setActiveAssignmentId(id)}
           onCopyPrompt={async (task, kind) => {
@@ -375,7 +418,21 @@ export function App(): ReactNode {
             try { await refreshPr(taskId); setToast("Pull request refreshed"); }
             catch (caught) { setError(messageFor(caught)); }
           }}
-          onArchive={(task) => setArchiveRequest({ task, resolve: () => void runCommand({ type: "archive_task", taskId: task.id }).then(() => setToast("Task archived")).catch((caught) => setError(messageFor(caught))), reject: () => undefined })}
+          onArchive={(task) => setArchiveRequest({
+            task,
+            resolve: () => void runCommand({ type: "archive_task", taskId: task.id })
+              .then(async () => { setSelected(null); if (archiveOpen) await loadArchive(); setToast("Task archived"); })
+              .catch((caught) => setError(messageFor(caught))),
+            reject: () => undefined,
+          })}
+          onCancelTask={(task) => setCancelRequest({
+            task,
+            suggestedReason: "",
+            resolve: (reason) => void runCommand({ type: "cancel_task", taskId: task.id, reason })
+              .then(async () => { setSelected(null); if (archiveOpen) await loadArchive(); setToast("Task canceled and archived"); })
+              .catch((caught) => setError(messageFor(caught))),
+            reject: () => undefined,
+          })}
           onDevelopmentLogin={async () => {
             try { setUser(await createDevelopmentSession()); await refreshDirectory(); await openFromLocation(); }
             catch (caught) { setError(messageFor(caught)); }
@@ -415,6 +472,14 @@ export function App(): ReactNode {
           confirmLabel="Archive task"
           onCancel={() => { archiveRequest.reject(new DOMException("Archive declined", "AbortError")); setArchiveRequest(null); }}
           onConfirm={() => { archiveRequest.resolve(); setArchiveRequest(null); }}
+        />
+      )}
+      {cancelRequest && (
+        <CancelDialog
+          task={cancelRequest.task}
+          initialReason={cancelRequest.suggestedReason}
+          onCancel={() => { cancelRequest.reject(new DOMException("Cancellation declined", "AbortError")); setCancelRequest(null); }}
+          onConfirm={(reason) => { cancelRequest.resolve(reason); setCancelRequest(null); }}
         />
       )}
       {error && <Notice kind="error" onClose={() => setError(null)}>{error}</Notice>}
@@ -534,18 +599,22 @@ function BoardPage(props: {
   activeAssignmentId: string | null;
   realtime: "connecting" | "live" | "offline" | "preview";
   toolNames: string[];
+  archiveOpen: boolean;
+  archivedTasks: TaskView[];
   onBack: () => void;
   onSelect: (id: string | null) => void;
   onNewTask: () => void;
+  onToggleArchive: () => void;
   onEditTask: (task: TaskView) => void;
   onPinAssignment: (id: string) => void;
   onCopyPrompt: (task: TaskView, kind: "planning" | "implementation") => void;
   onRelease: (assignmentId: string) => void;
   onRefreshPr: (taskId: string) => void;
   onArchive: (task: TaskView) => void;
+  onCancelTask: (task: TaskView) => void;
   onDevelopmentLogin: () => void;
 }): ReactNode {
-  const selected = props.board.tasks.find((task) => task.id === props.selectedTaskId) ?? null;
+  const selected = [...props.board.tasks, ...props.archivedTasks].find((task) => task.id === props.selectedTaskId) ?? null;
   const counts = useMemo(() => Object.fromEntries(TASK_COLUMNS.map((column) => [column, props.board.tasks.filter((task) => task.column === column).length])) as Record<TaskColumn, number>, [props.board.tasks]);
   return (
     <main className={`board-page${selected ? " has-drawer" : ""}${props.board.materialized ? "" : " has-preview"}`}>
@@ -557,6 +626,7 @@ function BoardPage(props: {
         <div className="board-actions">
           <span className={`live-state ${props.realtime}`}><i />{props.realtime}</span>
           <span className="tool-state">WebMCP {props.toolNames.length ? `${props.toolNames.length} tools` : "unavailable"}</span>
+          {props.board.viewer.canMutate && <button className={`secondary-button compact${props.archiveOpen ? " active" : ""}`} onClick={props.onToggleArchive}>Archived{props.archivedTasks.length ? ` ${props.archivedTasks.length}` : ""}</button>}
           {props.board.viewer.canMutate && <button className="primary-button compact" onClick={props.onNewTask}>New task</button>}
         </div>
       </header>
@@ -600,6 +670,24 @@ function BoardPage(props: {
           </div>
         ))}
       </section>
+      {props.archiveOpen && (
+        <section className="archive-shelf" aria-labelledby="archive-heading">
+          <div className="archive-heading">
+            <div><p className="eyebrow">Repository history</p><h2 id="archive-heading">Archived tasks</h2></div>
+            <span>{props.archivedTasks.length}</span>
+          </div>
+          {props.archivedTasks.length ? (
+            <div className="archive-grid">{props.archivedTasks.map((task) => (
+              <button className={`archive-card ${task.resolution ?? "completed"}`} key={task.id} onClick={() => props.onSelect(task.id)}>
+                <span className="archive-result">{task.resolution === "canceled" ? "Canceled" : "Completed"}</span>
+                <strong>{task.title}</strong>
+                <small>{formatTime(task.archivedAt ?? task.updatedAt)}{task.pullRequest ? ` · PR #${task.pullRequest.number}` : ""}</small>
+                {task.resolutionReason && <p>{task.resolutionReason}</p>}
+              </button>
+            ))}</div>
+          ) : <div className="empty-archive">Completed and canceled work will collect here.</div>}
+        </section>
+      )}
       {selected && (
         <TaskDrawer
           task={selected}
@@ -613,6 +701,7 @@ function BoardPage(props: {
           onRelease={props.onRelease}
           onRefreshPr={props.onRefreshPr}
           onArchive={props.onArchive}
+          onCancelTask={props.onCancelTask}
         />
       )}
     </main>
@@ -654,6 +743,7 @@ function TaskDrawer(props: {
   onRelease: (id: string) => void;
   onRefreshPr: (id: string) => void;
   onArchive: (task: TaskView) => void;
+  onCancelTask: (task: TaskView) => void;
 }): ReactNode {
   const { task } = props;
   const assignmentIsActive = task.assignment?.id === props.activeAssignmentId;
@@ -661,18 +751,22 @@ function TaskDrawer(props: {
     <aside className="task-drawer" aria-label={`Task ${task.title}`}>
       <header className="drawer-header"><span className="task-id">{shortId(task.id)}</span><button onClick={props.onClose} aria-label="Close task details">×</button></header>
       <div className="drawer-scroll">
-        <p className="column-label" data-column={task.column}>{COLUMN_COPY[task.column].label}</p>
+        <p className="column-label" data-column={task.column}>{task.archivedAt ? (task.resolution === "canceled" ? "Canceled" : "Completed · archived") : COLUMN_COPY[task.column].label}</p>
         <h2>{task.title}</h2>
+        {task.archivedAt && <section className={`resolution-banner ${task.resolution ?? "completed"}`}><strong>{task.resolution === "canceled" ? "Work abandoned" : "Work completed"}</strong><span>{formatTime(task.resolvedAt ?? task.archivedAt)}</span>{task.resolutionReason && <p>{task.resolutionReason}</p>}</section>}
         <MarkdownText value={task.description || "No description supplied."} />
         <div className="drawer-actions">
-          {props.board.viewer.canMutate && task.column === "todo" && !task.assignment && <button className="primary-button" onClick={() => props.onCopyPrompt(task, "planning")}>Copy planning prompt</button>}
-          {props.board.viewer.canMutate && ["ready", "in_progress", "in_pr"].includes(task.column) && !task.assignment && <button className="primary-button" onClick={() => props.onCopyPrompt(task, "implementation")}>Copy implementation prompt</button>}
-          {props.board.viewer.canMutate && task.column === "todo" && !task.assignment && <button className="secondary-button" onClick={props.onEdit}>Edit task</button>}
+          {props.board.viewer.canMutate && !task.archivedAt && task.column === "todo" && !task.assignment && <button className="primary-button" onClick={() => props.onCopyPrompt(task, "planning")}>Copy planning prompt</button>}
+          {props.board.viewer.canMutate && !task.archivedAt && ["ready", "in_progress", "in_pr"].includes(task.column) && !task.assignment && <button className="primary-button" onClick={() => props.onCopyPrompt(task, "implementation")}>Copy implementation prompt</button>}
+          {props.board.viewer.canMutate && !task.archivedAt && task.column === "todo" && !task.assignment && <button className="secondary-button" onClick={props.onEdit}>Edit task</button>}
           {task.assignment?.isMine && !assignmentIsActive && <button className="primary-button" onClick={() => props.onPin(task.assignment!.id)}>Use assignment in this tab</button>}
           {task.assignment?.isMine && <button className="secondary-button" onClick={() => props.onRelease(task.assignment!.id)}>Release assignment</button>}
-          {task.pullRequest && <button className="secondary-button" onClick={() => props.onRefreshPr(task.id)}>Sync GitHub status</button>}
-          {props.board.viewer.canMutate && task.column === "done" && <button className="danger-button" onClick={() => props.onArchive(task)}>Archive task</button>}
+          {task.pullRequest && !task.archivedAt && <button className="secondary-button" onClick={() => props.onRefreshPr(task.id)}>Sync GitHub status</button>}
+          {props.board.viewer.canMutate && !task.archivedAt && ["todo", "ready", "in_progress"].includes(task.column) && <button className="danger-button" onClick={() => props.onCancelTask(task)}>Cancel task</button>}
+          {props.board.viewer.canMutate && !task.archivedAt && task.column === "done" && <button className="danger-button" onClick={() => props.onArchive(task)}>Archive task</button>}
         </div>
+
+        {!task.archivedAt && task.column === "in_pr" && <p className="workflow-note">To abandon this work, close the pull request on GitHub. Repo Board will return it to In Progress, where it can be canceled.</p>}
 
         {task.assignment && <AssignmentPanel task={task} active={assignmentIsActive} />}
         {task.plan && <section className="detail-section"><div className="detail-heading"><h3>Delegated plan</h3><span>v{task.plan.revision}</span></div><p className="approval-line">Approved by assignment · @{task.plan.authorLogin}</p><MarkdownText value={task.plan.markdown} /></section>}
@@ -699,7 +793,43 @@ function AssignmentPanel({ task, active }: { task: TaskView; active: boolean }):
 
 function PullRequestPanel({ task }: { task: TaskView }): ReactNode {
   const pr = task.pullRequest!;
-  return <section className="detail-section pr-panel"><div className="detail-heading"><h3>Pull request</h3><a href={pr.url} target="_blank" rel="noreferrer">#{pr.number} ↗</a></div><strong>{pr.title}</strong><div className="pr-grid"><span><b>{pr.approvals}</b> approvals</span><span className={pr.changesRequestedBy.length ? "danger" : ""}><b>{pr.changesRequestedBy.length}</b> changes requested</span><span><b>{pr.reviewCommentCount + pr.conversationCommentCount}</b> comments</span><span className={pr.checks.failed ? "danger" : pr.checks.pending ? "warning" : "success"}><b>{pr.checks.passed}/{pr.checks.passed + pr.checks.pending + pr.checks.failed}</b> checks passed</span></div>{pr.changesRequestedBy.length > 0 && <p>Changes requested by {pr.changesRequestedBy.map((reviewer) => `@${reviewer}`).join(", ")}</p>}<small>Synced {formatTime(pr.syncedAt)} · {pr.headSha.slice(0, 7)}</small></section>;
+  const reviewLabel = pullRequestApprovalLabel(pr);
+  const readiness = pullRequestReadiness(pr);
+  return <section className="detail-section pr-panel">
+    <div className="detail-heading"><h3>Pull request</h3><a href={pr.url} target="_blank" rel="noreferrer">#{pr.number} ↗</a></div>
+    <strong>{pr.title}</strong>
+    <div className={`merge-readiness ${readiness.tone}`}><i />{readiness.label}</div>
+    <div className="pr-grid">
+      <span><b>{reviewLabel}</b><small>{pr.reviewRequirement.codeOwnerReviewRequired ? "Code owner required" : "Review status"}</small></span>
+      <span className={pr.changesRequestedBy.length ? "danger" : ""}><b>{pr.changesRequestedBy.length}</b><small>changes requested</small></span>
+      <span><b>{pr.reviewCommentCount + pr.conversationCommentCount}</b><small>comments</small></span>
+      <span className={pr.checks.failed ? "danger" : pr.checks.pending ? "warning" : "success"}><b>{pr.checks.passed}/{pr.checks.passed + pr.checks.pending + pr.checks.failed}</b><small>checks passed</small></span>
+    </div>
+    {pr.changesRequestedBy.length > 0 && <p>Changes requested by {pr.changesRequestedBy.map((reviewer) => `@${reviewer}`).join(", ")}</p>}
+    {pr.reviewRequirement.latestPushApprovalRequired && <p className="pr-rule-note">The latest push must be approved by someone other than its author.</p>}
+    <small>Synced {formatTime(pr.syncedAt)} · {pr.baseRef} · {pr.headSha.slice(0, 7)}</small>
+  </section>;
+}
+
+export function pullRequestApprovalLabel(pr: PullRequestSnapshot): string {
+  const required = pr.reviewRequirement.requiredApprovals;
+  return required === null ? `${pr.approvals} approval${pr.approvals === 1 ? "" : "s"}` : `${pr.approvals} of ${required} approvals`;
+}
+
+export function pullRequestReadiness(pr: PullRequestSnapshot): { label: string; tone: "success" | "warning" | "danger" | "neutral" } {
+  if (pr.merged) return { label: "Merged", tone: "success" };
+  if (pr.state === "closed") return { label: "Closed without merge", tone: "danger" };
+  if (pr.draft) return { label: "Draft", tone: "neutral" };
+  if (pr.changesRequestedBy.length || pr.reviewRequirement.decision === "changes_requested") return { label: "Changes requested", tone: "danger" };
+  if (pr.checks.failed) return { label: "Checks failing", tone: "danger" };
+  if (pr.checks.pending) return { label: "Checks pending", tone: "warning" };
+  if (pr.reviewRequirement.decision === "review_required"
+    || (pr.reviewRequirement.requiredApprovals !== null && pr.approvals < pr.reviewRequirement.requiredApprovals)) {
+    return { label: "Review required", tone: "warning" };
+  }
+  if (pr.mergeState === "clean" || pr.mergeState === "has_hooks" || pr.reviewRequirement.decision === "approved") return { label: "Ready to merge", tone: "success" };
+  if (pr.mergeState === "blocked" || pr.mergeState === "dirty" || pr.mergeState === "behind") return { label: "Merge blocked", tone: "warning" };
+  return { label: "Reviews approved", tone: "success" };
 }
 
 function TaskEditor({ task, onCancel, onSave }: { task: TaskView | "new"; onCancel: () => void; onSave: (value: { title: string; description: string }) => void }): ReactNode {
@@ -711,6 +841,17 @@ function TaskEditor({ task, onCancel, onSave }: { task: TaskView | "new"; onCanc
 
 function ConfirmDialog({ title, body, confirmLabel, onCancel, onConfirm }: { title: string; body: string; confirmLabel: string; onCancel: () => void; onConfirm: () => void }): ReactNode {
   return <div className="modal-backdrop" role="presentation"><div className="modal confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><p className="eyebrow">Human confirmation</p><h2 id="confirm-title">{title}</h2><p>{body}</p><div className="modal-actions"><button className="secondary-button" onClick={onCancel}>Keep task</button><button className="danger-button" onClick={onConfirm}>{confirmLabel}</button></div></div></div>;
+}
+
+function CancelDialog({ task, initialReason, onCancel, onConfirm }: { task: TaskView; initialReason: string; onCancel: () => void; onConfirm: (reason: string) => void }): ReactNode {
+  const [reason, setReason] = useState(initialReason);
+  return <div className="modal-backdrop" role="presentation"><form className="modal cancel-dialog" role="dialog" aria-modal="true" aria-labelledby="cancel-title" onSubmit={(event) => { event.preventDefault(); onConfirm(reason.trim()); }}>
+    <p className="eyebrow">Human confirmation</p>
+    <h2 id="cancel-title">Cancel “{task.title}”?</h2>
+    <p>This ends any active assignment and moves the task into archived history as canceled. It cannot be resumed from the board.</p>
+    <label>Reason<textarea autoFocus value={reason} onChange={(event) => setReason(event.target.value)} minLength={1} maxLength={500} rows={4} required placeholder="Why is this work being abandoned?" /></label>
+    <div className="modal-actions"><button type="button" className="secondary-button" onClick={onCancel}>Keep task</button><button type="submit" className="danger-button">Cancel and archive</button></div>
+  </form></div>;
 }
 
 function MarkdownText({ value }: { value: string }): ReactNode {

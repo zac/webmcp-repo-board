@@ -102,13 +102,17 @@ export async function fetchPullRequestSnapshot(owner: string, repo: string, numb
   const base = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
   const pull = recordValue(await githubJson(`${base}/pulls/${number}`, token));
   const head = recordField(pull, "head");
+  const pullBase = recordField(pull, "base");
   const headSha = stringField(head, "sha");
-  const [reviewsValue, reviewCommentsValue, conversationCommentsValue, checksValue, statusesValue] = await Promise.all([
+  const baseRef = stringField(pullBase, "ref");
+  const [reviewsValue, reviewCommentsValue, conversationCommentsValue, checksValue, statusesValue, reviewState, rules] = await Promise.all([
     githubJson(`${base}/pulls/${number}/reviews?per_page=100`, token),
     githubJson(`${base}/pulls/${number}/comments?per_page=100`, token),
     githubJson(`${base}/issues/${number}/comments?per_page=100`, token),
     githubJson(`${base}/commits/${headSha}/check-runs?per_page=100`, token),
     githubJson(`${base}/commits/${headSha}/statuses?per_page=100`, token),
+    fetchPullRequestReviewState(owner, repo, number, token),
+    fetchPullRequestRules(base, baseRef, token),
   ]);
 
   const reviews = arrayValue(reviewsValue).map((value) => recordValue(value));
@@ -116,7 +120,8 @@ export async function fetchPullRequestSnapshot(owner: string, repo: string, numb
   for (const review of reviews) {
     const user = recordField(review, "user");
     const login = stringField(user, "login");
-    latestByReviewer.set(login, review);
+    const state = optionalString(review, "state");
+    if (state === "APPROVED" || state === "CHANGES_REQUESTED" || state === "DISMISSED") latestByReviewer.set(login, review);
   }
   const latest = [...latestByReviewer.entries()];
   const approvals = latest.filter(([, review]) => optionalString(review, "state") === "APPROVED").length;
@@ -150,14 +155,78 @@ export async function fetchPullRequestSnapshot(owner: string, repo: string, numb
     draft: Boolean(pull.draft),
     merged: Boolean(pull.merged),
     headSha,
+    baseRef,
     approvals,
     changesRequestedBy,
+    reviewRequirement: {
+      requiredApprovals: rules.requiredApprovals,
+      decision: reviewState.decision,
+      codeOwnerReviewRequired: rules.codeOwnerReviewRequired,
+      latestPushApprovalRequired: rules.latestPushApprovalRequired,
+    },
+    mergeState: reviewState.mergeState,
     reviewCommentCount: arrayValue(reviewCommentsValue).length,
     conversationCommentCount: arrayValue(conversationCommentsValue).length,
     checks: { passed: passedNames.length, failed: failedNames.length, pending: pendingNames.length, failedNames: failedNames.slice(0, 20), pendingNames: pendingNames.slice(0, 20) },
     recentReviews,
     syncedAt: Date.now(),
   };
+}
+
+interface PullRequestReviewState {
+  decision: PullRequestSnapshot["reviewRequirement"]["decision"];
+  mergeState: string | null;
+}
+
+interface PullRequestRules {
+  requiredApprovals: number | null;
+  codeOwnerReviewRequired: boolean | null;
+  latestPushApprovalRequired: boolean | null;
+}
+
+async function fetchPullRequestReviewState(owner: string, repo: string, number: number, token: string | null): Promise<PullRequestReviewState> {
+  try {
+    const value = recordValue(await githubJson("/graphql", token, {
+      method: "POST",
+      body: JSON.stringify({
+        query: "query PullRequestReviewState($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { reviewDecision mergeStateStatus } } }",
+        variables: { owner, repo, number },
+      }),
+    }));
+    const pullRequest = recordField(recordField(recordField(value, "data"), "repository"), "pullRequest");
+    const rawDecision = optionalString(pullRequest, "reviewDecision");
+    const decision = rawDecision === "APPROVED" ? "approved"
+      : rawDecision === "CHANGES_REQUESTED" ? "changes_requested"
+        : rawDecision === "REVIEW_REQUIRED" ? "review_required"
+          : null;
+    return { decision, mergeState: optionalString(pullRequest, "mergeStateStatus")?.toLowerCase() ?? null };
+  } catch (error) {
+    if (error instanceof GitHubError || error instanceof TypeError) return { decision: null, mergeState: null };
+    throw error;
+  }
+}
+
+async function fetchPullRequestRules(base: string, baseRef: string, token: string | null): Promise<PullRequestRules> {
+  try {
+    const value = await githubJson(`${base}/rules/branches/${encodeURIComponent(baseRef)}?per_page=100`, token);
+    const pullRequestRules = arrayValue(value)
+      .map(recordValue)
+      .filter((rule) => optionalString(rule, "type") === "pull_request")
+      .map((rule) => recordField(rule, "parameters"));
+    if (pullRequestRules.length === 0) {
+      return { requiredApprovals: 0, codeOwnerReviewRequired: false, latestPushApprovalRequired: false };
+    }
+    return {
+      requiredApprovals: Math.max(...pullRequestRules.map((parameters) => optionalNumber(parameters, "required_approving_review_count") ?? 0)),
+      codeOwnerReviewRequired: pullRequestRules.some((parameters) => optionalBoolean(parameters, "require_code_owner_review") === true),
+      latestPushApprovalRequired: pullRequestRules.some((parameters) => optionalBoolean(parameters, "require_last_push_approval") === true),
+    };
+  } catch (error) {
+    if (error instanceof GitHubError || error instanceof TypeError) {
+      return { requiredApprovals: null, codeOwnerReviewRequired: null, latestPushApprovalRequired: null };
+    }
+    throw error;
+  }
 }
 
 export async function verifyWebhookSignature(body: ArrayBuffer, signatureHeader: string | null, secret: string): Promise<boolean> {
@@ -341,6 +410,16 @@ function booleanField(value: unknown, key: string): boolean {
   const result = recordValue(value)[key];
   if (typeof result !== "boolean") throw new GitHubError("invalid_github_response", `GitHub response omitted ${key}`, 502);
   return result;
+}
+
+function optionalBoolean(value: Record<string, unknown>, key: string): boolean | null {
+  const result = value[key];
+  return typeof result === "boolean" ? result : null;
+}
+
+function optionalNumber(value: Record<string, unknown>, key: string): number | null {
+  const result = value[key];
+  return typeof result === "number" && Number.isFinite(result) ? result : null;
 }
 
 function githubMessage(value: unknown): string | null {

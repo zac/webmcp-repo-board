@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { TransitionError, assertClaimAllowed, canArchive, columnForPullRequest, requiredAssignmentKind } from "./transitions";
+import { TransitionError, assertClaimAllowed, canArchive, canCancel, columnForPullRequest, requiredAssignmentKind } from "./transitions";
 import type { PullRequestSnapshot, TaskColumn } from "./types";
 
 function snapshot(overrides: Partial<PullRequestSnapshot> = {}): PullRequestSnapshot {
@@ -11,8 +11,11 @@ function snapshot(overrides: Partial<PullRequestSnapshot> = {}): PullRequestSnap
     draft: false,
     merged: false,
     headSha: "abc123",
+    baseRef: "main",
     approvals: 0,
     changesRequestedBy: [],
+    reviewRequirement: { requiredApprovals: 2, decision: "review_required", codeOwnerReviewRequired: false, latestPushApprovalRequired: false },
+    mergeState: "blocked",
     reviewCommentCount: 0,
     conversationCommentCount: 0,
     checks: { passed: 0, failed: 0, pending: 0, failedNames: [], pendingNames: [] },
@@ -48,5 +51,12 @@ describe("task transitions", () => {
     expect(canArchive("done", null)).toBe(true);
     expect(canArchive("done", 1)).toBe(false);
     expect(canArchive("in_pr", null)).toBe(false);
+  });
+
+  it("cancels only active work before a pull request", () => {
+    for (const column of ["todo", "ready", "in_progress"] satisfies TaskColumn[]) expect(canCancel(column, null)).toBe(true);
+    expect(canCancel("in_pr", null)).toBe(false);
+    expect(canCancel("done", null)).toBe(false);
+    expect(canCancel("todo", 1)).toBe(false);
   });
 });

@@ -39,6 +39,7 @@ export interface BoardToolHandlers {
   runCommand: (command: BoardCommand, signal: AbortSignal) => Promise<BoardView>;
   refreshPullRequest: (taskId: string, signal: AbortSignal) => Promise<BoardView>;
   confirmArchive: (task: TaskView, signal: AbortSignal) => Promise<void>;
+  confirmCancel: (task: TaskView, suggestedReason: string, signal: AbortSignal) => Promise<string>;
 }
 
 export function activeModelContext(): WebMcpContext | null {
@@ -95,6 +96,27 @@ export async function registerBoardTools(context: WebMcpContext, handlers: Board
     },
   });
 
+  const selected = board.tasks.find((task) => task.id === handlers.getSelectedTaskId());
+  if (board.viewer.canMutate && selected && selected.archivedAt === null && ["todo", "ready", "in_progress"].includes(selected.column)) {
+    await add({
+      name: "cancel_task",
+      title: "Cancel the selected task",
+      description: "Ask the human to confirm abandoning the selected task. Confirmation ends any active assignment and moves the task into archived history with a required reason.",
+      inputSchema: {
+        type: "object", additionalProperties: false,
+        properties: { reason: { type: "string", minLength: 1, maxLength: 500 } },
+        required: ["reason"],
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, untrustedContentHint: true },
+      execute: async (input, execution) => {
+        const combined = toolSignal(execution, signal);
+        const reason = await handlers.confirmCancel(selected, String(input.reason), combined);
+        const next = await handlers.runCommand({ type: "cancel_task", taskId: selected.id, reason }, combined);
+        return bounded({ status: "canceled", taskId: selected.id, reason, revision: next.revision });
+      },
+    });
+  }
+
   if (assignedTask?.assignment) {
     await addAssignmentTools(add, handlers, assignedTask, signal);
     return names;
@@ -129,7 +151,6 @@ export async function registerBoardTools(context: WebMcpContext, handlers: Board
       },
     });
 
-    const selected = board.tasks.find((task) => task.id === handlers.getSelectedTaskId());
     if (selected?.column === "done" && selected.archivedAt === null) {
       await add({
         name: "archive_task",
@@ -264,7 +285,7 @@ async function addAssignmentTools(
       execute: async (_input, execution) => {
         await renewReadAssignment(handlers, assignmentId, execution, registrySignal);
         const current = handlers.getBoard().tasks.find((candidate) => candidate.id === task.id) ?? task;
-        return bounded({ pullRequest: current.pullRequest!.number, approvals: current.pullRequest!.approvals, changesRequestedBy: current.pullRequest!.changesRequestedBy, reviewCommentCount: current.pullRequest!.reviewCommentCount, conversationCommentCount: current.pullRequest!.conversationCommentCount, recentReviews: current.pullRequest!.recentReviews });
+        return bounded({ pullRequest: current.pullRequest!.number, approvals: current.pullRequest!.approvals, reviewRequirement: current.pullRequest!.reviewRequirement, mergeState: current.pullRequest!.mergeState, changesRequestedBy: current.pullRequest!.changesRequestedBy, reviewCommentCount: current.pullRequest!.reviewCommentCount, conversationCommentCount: current.pullRequest!.conversationCommentCount, recentReviews: current.pullRequest!.recentReviews });
       },
     });
     await add({
@@ -336,9 +357,12 @@ function taskSummary(task: TaskView): Record<string, unknown> {
     id: task.id,
     title: task.title,
     column: task.column,
+    resolution: task.resolution,
+    resolutionReason: task.resolutionReason,
+    archivedAt: task.archivedAt,
     planRevision: task.plan?.revision ?? null,
     assignment: task.assignment ? { user: task.assignment.userLogin, agentLabel: task.assignment.agentLabel, phase: task.assignment.phase, summary: task.assignment.summary, leaseExpiresAt: task.assignment.leaseExpiresAt } : null,
-    pullRequest: task.pullRequest ? { number: task.pullRequest.number, state: task.pullRequest.state, merged: task.pullRequest.merged, approvals: task.pullRequest.approvals, changesRequested: task.pullRequest.changesRequestedBy.length, checks: task.pullRequest.checks } : null,
+    pullRequest: task.pullRequest ? { number: task.pullRequest.number, state: task.pullRequest.state, merged: task.pullRequest.merged, approvals: task.pullRequest.approvals, reviewRequirement: task.pullRequest.reviewRequirement, mergeState: task.pullRequest.mergeState, changesRequested: task.pullRequest.changesRequestedBy.length, checks: task.pullRequest.checks } : null,
   };
 }
 

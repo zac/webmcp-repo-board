@@ -1,6 +1,9 @@
 export const TASK_COLUMNS = ["todo", "ready", "in_progress", "in_pr", "done"] as const;
 export type TaskColumn = (typeof TASK_COLUMNS)[number];
 
+export const TASK_RESOLUTIONS = ["completed", "canceled"] as const;
+export type TaskResolution = (typeof TASK_RESOLUTIONS)[number];
+
 export const ASSIGNMENT_KINDS = ["planning", "implementation"] as const;
 export type AssignmentKind = (typeof ASSIGNMENT_KINDS)[number];
 
@@ -73,8 +76,16 @@ export interface PullRequestSnapshot {
   draft: boolean;
   merged: boolean;
   headSha: string;
+  baseRef: string;
   approvals: number;
   changesRequestedBy: string[];
+  reviewRequirement: {
+    requiredApprovals: number | null;
+    decision: "approved" | "changes_requested" | "review_required" | null;
+    codeOwnerReviewRequired: boolean | null;
+    latestPushApprovalRequired: boolean | null;
+  };
+  mergeState: string | null;
   reviewCommentCount: number;
   conversationCommentCount: number;
   checks: {
@@ -104,6 +115,9 @@ export interface TaskView {
   description: string;
   column: TaskColumn;
   archivedAt: number | null;
+  resolution: TaskResolution | null;
+  resolutionReason: string | null;
+  resolvedAt: number | null;
   createdBy: string;
   createdAt: number;
   updatedAt: number;
@@ -155,6 +169,7 @@ export type BoardCommand =
   | { type: "start_work"; assignmentId: string }
   | { type: "release_task"; assignmentId: string }
   | { type: "link_pull_request"; assignmentId: string; url: string }
+  | { type: "cancel_task"; taskId: string; reason: string }
   | { type: "archive_task"; taskId: string };
 
 export type InternalBoardCommand = Exclude<BoardCommand, { type: "link_pull_request" }> |

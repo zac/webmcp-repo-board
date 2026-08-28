@@ -71,11 +71,13 @@ describe("GitHub boundaries", () => {
       draft: false,
       merged: false,
       head: { sha: "sha-9" },
+      base: { ref: "main" },
     });
     responses.set("/repos/acme/widgets/pulls/9/reviews?per_page=100", [
       { id: 1, user: { login: "alice" }, state: "APPROVED", body: "Earlier", submitted_at: "2026-01-01T00:00:00Z", html_url: "https://github.com/review/1" },
       { id: 2, user: { login: "alice" }, state: "CHANGES_REQUESTED", body: "Please fix", submitted_at: "2026-01-02T00:00:00Z", html_url: "https://github.com/review/2" },
       { id: 3, user: { login: "bob" }, state: "APPROVED", body: "Looks good", submitted_at: "2026-01-03T00:00:00Z", html_url: "https://github.com/review/3" },
+      { id: 4, user: { login: "bob" }, state: "COMMENTED", body: "One note", submitted_at: "2026-01-04T00:00:00Z", html_url: "https://github.com/review/4" },
     ]);
     responses.set("/repos/acme/widgets/pulls/9/comments?per_page=100", [{ id: 1 }, { id: 2 }]);
     responses.set("/repos/acme/widgets/issues/9/comments?per_page=100", [{ id: 1 }]);
@@ -91,8 +93,15 @@ describe("GitHub boundaries", () => {
       { context: "security", state: "error" },
       { context: "preview", state: "pending" },
     ]);
-    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    responses.set("/repos/acme/widgets/rules/branches/main?per_page=100", [{
+      type: "pull_request",
+      parameters: { required_approving_review_count: 2, require_code_owner_review: true, require_last_push_approval: true },
+    }]);
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname === "/graphql" && init?.method === "POST") {
+        return Response.json({ data: { repository: { pullRequest: { reviewDecision: "REVIEW_REQUIRED", mergeStateStatus: "BLOCKED" } } } });
+      }
       if (!responses.has(`${url.pathname}${url.search}`)) return Response.json({ message: "Unexpected request" }, { status: 500 });
       return Response.json(responses.get(`${url.pathname}${url.search}`));
     }));
@@ -100,7 +109,15 @@ describe("GitHub boundaries", () => {
     const result = await fetchPullRequestSnapshot("acme", "widgets", 9, "installation-token");
     expect(result).toMatchObject({
       approvals: 1,
+      baseRef: "main",
       changesRequestedBy: ["alice"],
+      reviewRequirement: {
+        requiredApprovals: 2,
+        decision: "review_required",
+        codeOwnerReviewRequired: true,
+        latestPushApprovalRequired: true,
+      },
+      mergeState: "blocked",
       reviewCommentCount: 2,
       conversationCommentCount: 1,
       checks: {
@@ -111,6 +128,24 @@ describe("GitHub boundaries", () => {
         pendingNames: ["browser", "preview"],
       },
     });
-    expect(result.recentReviews.map((review) => review.id)).toEqual([3, 2, 1]);
+    expect(result.recentReviews.map((review) => review.id)).toEqual([4, 3, 2, 1]);
+  });
+
+  it("keeps the core pull request snapshot when review-rule metadata is unavailable", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname.endsWith("/pulls/10")) return Response.json({
+        html_url: "https://github.com/acme/widgets/pull/10", title: "Small fix", state: "open", draft: false, merged: false,
+        head: { sha: "sha-10" }, base: { ref: "main" },
+      });
+      if (url.pathname === "/graphql" || url.pathname.includes("/rules/branches/")) return Response.json({ message: "Unavailable" }, { status: 403 });
+      if (url.pathname.endsWith("/check-runs")) return Response.json({ check_runs: [] });
+      return Response.json([]);
+    }));
+
+    const result = await fetchPullRequestSnapshot("acme", "widgets", 10, "installation-token");
+
+    expect(result.reviewRequirement).toEqual({ requiredApprovals: null, decision: null, codeOwnerReviewRequired: null, latestPushApprovalRequired: null });
+    expect(result.mergeState).toBeNull();
   });
 });

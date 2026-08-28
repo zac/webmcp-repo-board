@@ -44,6 +44,9 @@ export function parseCommandEnvelope(value: unknown): CommandEnvelope {
     case "archive_task":
       command = { type, taskId: identifier(commandObject.taskId, "taskId") };
       break;
+    case "cancel_task":
+      command = { type, taskId: identifier(commandObject.taskId, "taskId"), reason: boundedString(commandObject.reason, "reason", 1, 500) };
+      break;
     default:
       throw new ValidationError("unknown_command", "Command type is not supported");
   }

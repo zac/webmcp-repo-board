@@ -3,6 +3,7 @@ import {
   TransitionError,
   assertClaimAllowed,
   canArchive,
+  canCancel,
   columnForPullRequest,
   type Actor,
   type AgentPhase,
@@ -42,6 +43,9 @@ interface TaskRow extends Record<string, SqlStorageValue> {
   description: string;
   column_name: TaskColumn;
   archived_at: number | null;
+  resolution: "completed" | "canceled" | null;
+  resolution_reason: string | null;
+  resolved_at: number | null;
   created_by: string;
   created_at: number;
   updated_at: number;
@@ -186,7 +190,10 @@ export class RepoBoard extends DurableObject<Env> {
   async listPullRequestsDue(now: number, limit = 25): Promise<LinkedPullRequest[]> {
     return this.ctx.storage.sql
       .exec<{ task_id: string; pr_number: number; next_reconcile_at: number }>(
-        "SELECT task_id, pr_number, next_reconcile_at FROM pr_snapshots WHERE reconcile_due = 1 OR next_reconcile_at <= ? ORDER BY next_reconcile_at LIMIT ?",
+        `SELECT pr.task_id, pr.pr_number, pr.next_reconcile_at
+         FROM pr_snapshots pr JOIN tasks task ON task.id = pr.task_id
+         WHERE task.archived_at IS NULL AND (pr.reconcile_due = 1 OR pr.next_reconcile_at <= ?)
+         ORDER BY pr.next_reconcile_at LIMIT ?`,
         now,
         limit,
       )
@@ -197,7 +204,9 @@ export class RepoBoard extends DurableObject<Env> {
   async listLinkedPullRequests(limit = 100): Promise<LinkedPullRequest[]> {
     return this.ctx.storage.sql
       .exec<{ task_id: string; pr_number: number; next_reconcile_at: number }>(
-        "SELECT task_id, pr_number, next_reconcile_at FROM pr_snapshots ORDER BY task_id LIMIT ?",
+        `SELECT pr.task_id, pr.pr_number, pr.next_reconcile_at
+         FROM pr_snapshots pr JOIN tasks task ON task.id = pr.task_id
+         WHERE task.archived_at IS NULL ORDER BY pr.task_id LIMIT ?`,
         limit,
       )
       .toArray()
@@ -208,7 +217,7 @@ export class RepoBoard extends DurableObject<Env> {
     const metadata = this.getMetadata();
     if (!metadata) return failure("board_not_initialized", "Board has not been initialized", 404);
     const task = this.ctx.storage.sql.exec<TaskRow>("SELECT * FROM tasks WHERE linked_pr_number = ?", snapshot.number).toArray()[0];
-    if (!task) return success(null);
+    if (!task || task.archived_at !== null) return success(null);
 
     const existing = this.ctx.storage.sql.exec<{ snapshot_json: string }>("SELECT snapshot_json FROM pr_snapshots WHERE task_id = ?", task.id).toArray()[0];
     const previous = existing ? (JSON.parse(existing.snapshot_json) as PullRequestSnapshot) : null;
@@ -230,8 +239,11 @@ export class RepoBoard extends DurableObject<Env> {
       );
       if (!materiallyChanged) return;
       this.ctx.storage.sql.exec(
-        "UPDATE tasks SET column_name = ?, updated_at = ?, task_revision = ? WHERE id = ?",
+        `UPDATE tasks SET column_name = ?, resolution = ?, resolution_reason = NULL, resolved_at = ?,
+         updated_at = ?, task_revision = ? WHERE id = ?`,
         nextColumn,
+        nextColumn === "done" ? "completed" : null,
+        nextColumn === "done" ? now : null,
         now,
         revision,
         task.id,
@@ -314,12 +326,22 @@ export class RepoBoard extends DurableObject<Env> {
     const expiredAssignments = this.ctx.storage.sql
       .exec<{ id: string; task_id: string; user_login: string }>("SELECT id, task_id, user_login FROM assignments WHERE status = 'active' AND lease_expires_at <= ?", now)
       .toArray();
-    const duePullRequests = this.ctx.storage.sql.exec<{ task_id: string }>("SELECT task_id FROM pr_snapshots WHERE next_reconcile_at <= ?", now).toArray();
+    const duePullRequests = this.ctx.storage.sql.exec<{ task_id: string }>(
+      `SELECT pr.task_id FROM pr_snapshots pr JOIN tasks task ON task.id = pr.task_id
+       WHERE task.archived_at IS NULL AND pr.next_reconcile_at <= ?`,
+      now,
+    ).toArray();
 
     let revision: number | null = null;
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec("UPDATE assignments SET status = 'expired', last_activity_at = ? WHERE status = 'active' AND lease_expires_at <= ?", now, now);
-      this.ctx.storage.sql.exec("UPDATE pr_snapshots SET reconcile_due = 1, next_reconcile_at = ? WHERE next_reconcile_at <= ?", now + RECONCILE_MS, now);
+      this.ctx.storage.sql.exec(
+        `UPDATE pr_snapshots SET reconcile_due = 1, next_reconcile_at = ?
+         WHERE task_id IN (SELECT pr.task_id FROM pr_snapshots pr JOIN tasks task ON task.id = pr.task_id
+         WHERE task.archived_at IS NULL AND pr.next_reconcile_at <= ?)`,
+        now + RECONCILE_MS,
+        now,
+      );
       if (expiredAssignments.length === 0 && duePullRequests.length === 0) return;
       revision = this.currentRevision() + 1;
       this.ctx.storage.sql.exec("UPDATE board_metadata SET revision = ? WHERE id = ?", revision, metadata.id);
@@ -494,6 +516,31 @@ export class RepoBoard extends DurableObject<Env> {
         this.ctx.storage.sql.exec("UPDATE tasks SET archived_at = ?, updated_at = ?, task_revision = ? WHERE id = ?", now, now, revision, task.id);
         return { type: "task_archived", taskId: task.id, data: { archived: true } };
       }
+      case "cancel_task": {
+        const task = this.requireTask(command.taskId);
+        if (!canCancel(task.column_name, task.archived_at)) {
+          const message = task.column_name === "in_pr"
+            ? "Close the linked pull request before canceling this task"
+            : "Only an active Todo, Ready, or In Progress task can be canceled";
+          throw new BoardError("task_not_cancelable", message, 409);
+        }
+        this.ctx.storage.sql.exec(
+          "UPDATE assignments SET status = 'canceled', last_activity_at = ? WHERE task_id = ? AND status = 'active'",
+          now,
+          task.id,
+        );
+        this.ctx.storage.sql.exec(
+          `UPDATE tasks SET resolution = 'canceled', resolution_reason = ?, resolved_at = ?, archived_at = ?,
+           updated_at = ?, task_revision = ? WHERE id = ?`,
+          command.reason,
+          now,
+          now,
+          now,
+          revision,
+          task.id,
+        );
+        return { type: "task_canceled", taskId: task.id, data: { archived: true, reason: command.reason } };
+      }
     }
   }
 
@@ -548,6 +595,16 @@ export class RepoBoard extends DurableObject<Env> {
       );
       INSERT OR IGNORE INTO _sql_schema_migrations (id, applied_at) VALUES (1, unixepoch() * 1000);
     `);
+    const migration = this.ctx.storage.sql.exec<{ id: number }>("SELECT MAX(id) AS id FROM _sql_schema_migrations").one().id;
+    if (migration < 2) {
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec("ALTER TABLE tasks ADD COLUMN resolution TEXT");
+        this.ctx.storage.sql.exec("ALTER TABLE tasks ADD COLUMN resolution_reason TEXT");
+        this.ctx.storage.sql.exec("ALTER TABLE tasks ADD COLUMN resolved_at INTEGER");
+        this.ctx.storage.sql.exec("UPDATE tasks SET resolution = 'completed', resolved_at = updated_at WHERE column_name = 'done'");
+        this.ctx.storage.sql.exec("INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (2, ?)", Date.now());
+      });
+    }
   }
 
   private getMetadata(): BoardMetadata | null {
@@ -651,6 +708,9 @@ export class RepoBoard extends DurableObject<Env> {
       description: task.description,
       column: task.column_name,
       archivedAt: task.archived_at,
+      resolution: task.resolution,
+      resolutionReason: task.resolution_reason,
+      resolvedAt: task.resolved_at,
       createdBy: task.created_by,
       createdAt: task.created_at,
       updatedAt: task.updated_at,
@@ -662,7 +722,7 @@ export class RepoBoard extends DurableObject<Env> {
         .map((row) => ({ revision: row.revision, title: row.title, description: row.description, authorUserId: row.author_user_id, authorLogin: row.author_login, createdAt: row.created_at } satisfies TaskRevision)),
       plan: planRow ? { revision: planRow.revision, markdown: planRow.markdown, authorUserId: planRow.author_user_id, authorLogin: planRow.author_login, createdAt: planRow.created_at, delegatedApproval: true } satisfies PlanRevision : null,
       assignment: assignment ? assignmentView(assignment, viewer.userId) : null,
-      pullRequest: prRow ? JSON.parse(prRow.snapshot_json) as PullRequestSnapshot : null,
+      pullRequest: prRow ? storedPullRequest(prRow.snapshot_json) : null,
       recentEvents: this.ctx.storage.sql.exec<{ id: number; revision: number; event_type: string; task_id: string | null; actor_login: string | null; occurred_at: number; data_json: string }>("SELECT * FROM events WHERE task_id = ? ORDER BY id DESC LIMIT 20", task.id).toArray().map(eventView),
     };
   }
@@ -687,7 +747,10 @@ export class RepoBoard extends DurableObject<Env> {
   private async rescheduleAlarm(): Promise<void> {
     const now = Date.now();
     const lease = this.ctx.storage.sql.exec<{ due: number | null }>("SELECT MIN(lease_expires_at) AS due FROM assignments WHERE status = 'active'").one().due;
-    const reconcile = this.ctx.storage.sql.exec<{ due: number | null }>("SELECT MIN(next_reconcile_at) AS due FROM pr_snapshots").one().due;
+    const reconcile = this.ctx.storage.sql.exec<{ due: number | null }>(
+      `SELECT MIN(pr.next_reconcile_at) AS due FROM pr_snapshots pr
+       JOIN tasks task ON task.id = pr.task_id WHERE task.archived_at IS NULL`,
+    ).one().due;
     let socketDue: number | null = null;
     for (const socket of this.ctx.getWebSockets()) {
       const attachment = socket.deserializeAttachment() as SocketAttachment | null;
@@ -730,6 +793,21 @@ function failure<T>(
 
 function parseStats(value: string): AgentStats {
   return JSON.parse(value) as AgentStats;
+}
+
+function storedPullRequest(value: string): PullRequestSnapshot {
+  const snapshot = JSON.parse(value) as PullRequestSnapshot;
+  return {
+    ...snapshot,
+    baseRef: snapshot.baseRef ?? "",
+    reviewRequirement: snapshot.reviewRequirement ?? {
+      requiredApprovals: null,
+      decision: null,
+      codeOwnerReviewRequired: null,
+      latestPushApprovalRequired: null,
+    },
+    mergeState: snapshot.mergeState ?? null,
+  };
 }
 
 function assignmentView(row: AssignmentRow, viewerUserId: string | null): AssignmentView {

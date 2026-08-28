@@ -19,8 +19,11 @@ function pullRequest(overrides: Partial<PullRequestSnapshot> = {}): PullRequestS
     draft: false,
     merged: false,
     headSha: "deadbeef",
+    baseRef: "main",
     approvals: 0,
     changesRequestedBy: [],
+    reviewRequirement: { requiredApprovals: 2, decision: "review_required", codeOwnerReviewRequired: false, latestPushApprovalRequired: false },
+    mergeState: "blocked",
     reviewCommentCount: 0,
     conversationCommentCount: 0,
     checks: { passed: 1, failed: 0, pending: 0, failedNames: [], pendingNames: [] },
@@ -113,11 +116,37 @@ describe("RepoBoard Durable Object", () => {
     expect(unwrap(await stub.applyPullRequest(pullRequest({ state: "closed", merged: true, syncedAt: 1 }), "delayed-webhook", Date.now()))).toBeNull();
     expect(unwrap(await stub.getView(viewer(ada), false)).tasks[0].column).toBe("in_pr");
     const merged = await stub.applyPullRequest(pullRequest({ state: "closed", merged: true, approvals: 2, syncedAt: newestSync + 1 }), "webhook", Date.now());
-    expect(unwrap(merged)?.tasks[0].column).toBe("done");
+    expect(unwrap(merged)?.tasks[0]).toMatchObject({ column: "done", resolution: "completed", resolutionReason: null });
     view = unwrap(await command(stub, zac, 10, { type: "archive_task", taskId }));
     expect(view.tasks).toHaveLength(0);
     const history = unwrap(await stub.getView(viewer(zac), true));
+    expect(history.tasks[0]).toMatchObject({ resolution: "completed", resolutionReason: null });
     expect(history.tasks[0].archivedAt).not.toBeNull();
+  });
+
+  it("cancels active work atomically and retains its reason in archived history", async () => {
+    const stub = await freshBoard("cancel");
+    let view = unwrap(await command(stub, zac, 0, { type: "create_task", title: "Obsolete approach", description: "Try an experiment" }));
+    const taskId = view.tasks[0].id;
+    view = unwrap(await command(stub, zac, 1, { type: "claim_task", taskId, kind: "planning", agentLabel: "Planner" }));
+    const assignmentId = view.tasks[0].assignment!.id;
+
+    view = unwrap(await command(stub, zac, 2, { type: "cancel_task", taskId, reason: "The upstream API now provides this behavior." }));
+
+    expect(view.tasks).toHaveLength(0);
+    const history = unwrap(await stub.getView(viewer(zac), true));
+    expect(history.tasks[0]).toMatchObject({
+      resolution: "canceled",
+      resolutionReason: "The upstream API now provides this behavior.",
+      assignment: null,
+    });
+    expect(history.tasks[0].archivedAt).not.toBeNull();
+    expect(history.tasks[0].resolvedAt).not.toBeNull();
+    expect(history.tasks[0].recentEvents[0]).toMatchObject({ type: "task_canceled", data: { archived: true } });
+
+    const staleMutation = await command(stub, zac, 3, { type: "report_progress", assignmentId, phase: "planning", summary: "Still working", stats: {} });
+    expect(staleMutation.ok).toBe(false);
+    if (!staleMutation.ok) expect(staleMutation.error.code).toBe("assignment_inactive");
   });
 
   it("atomically saves an explicitly approved plan and replaces planning with implementation", async () => {
@@ -163,6 +192,9 @@ describe("RepoBoard Durable Object", () => {
     const assignmentId = view.tasks[0].assignment!.id;
     unwrap(await command(stub, zac, 4, { type: "start_work", assignmentId }));
     unwrap(await command(stub, zac, 5, { type: "link_pull_request_snapshot", assignmentId, snapshot: pullRequest() }));
+    const cannotCancel = await command(stub, zac, 6, { type: "cancel_task", taskId, reason: "No longer needed" });
+    expect(cannotCancel.ok).toBe(false);
+    if (!cannotCancel.ok) expect(cannotCancel.error).toMatchObject({ code: "task_not_cancelable" });
     const closed = unwrap(await stub.applyPullRequest(pullRequest({ state: "closed" }), "webhook", Date.now()));
     expect(closed?.tasks[0].column).toBe("in_progress");
   });
