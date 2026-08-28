@@ -85,6 +85,7 @@ function handlers(boardValue: BoardView, selected = boardValue.tasks[0]?.id ?? n
     getBoard: () => boardValue,
     getSelectedTaskId: () => selected,
     getActiveAssignmentId: () => boardValue.tasks[0]?.assignment?.id ?? null,
+    loadTask: vi.fn(async (taskId) => boardValue.tasks.find((taskValue) => taskValue.id === taskId) ?? null),
     runCommand: vi.fn(async () => boardValue),
     refreshPullRequest: vi.fn(async () => boardValue),
     confirmArchive: vi.fn(async () => undefined),
@@ -99,7 +100,11 @@ async function namesFor(boardValue: BoardView): Promise<string[]> {
 
 describe("dynamic WebMCP profiles", () => {
   it("exposes only bounded read tools to anonymous viewers", async () => {
-    expect(await namesFor(board(task("todo"), false))).toEqual(["list_tasks", "inspect_task"]);
+    const registry = new Registry();
+    await registerBoardTools(registry, handlers(board(task("todo"), false)), new AbortController().signal);
+
+    expect([...registry.tools.keys()]).toEqual(["list_tasks", "inspect_task"]);
+    expect(registry.tools.get("inspect_task")?.annotations?.readOnlyHint).toBe(true);
   });
 
   it("exposes claiming to authorized unassigned viewers", async () => {
@@ -191,5 +196,36 @@ describe("dynamic WebMCP profiles", () => {
     expect(registry.tools.get("inspect_task")?.annotations?.untrustedContentHint).toBe(true);
     const result = await registry.tools.get("read_review")!.execute({});
     expect(String(result).length).toBeLessThanOrEqual(40_000);
+  });
+
+  it("loads archived task history without adding it to the live board", async () => {
+    const registry = new Registry();
+    const archivedTask = { ...task("done"), archivedAt: 100 };
+    const liveBoard = { ...board(task("done")), tasks: [] };
+    const toolHandlers = handlers(liveBoard, archivedTask.id);
+    toolHandlers.loadTask = vi.fn(async (taskId) => taskId === archivedTask.id ? archivedTask : null);
+    await registerBoardTools(registry, toolHandlers, new AbortController().signal);
+
+    const result = await registry.tools.get("inspect_task")!.execute({ taskId: archivedTask.id });
+
+    expect(result).toContain('"archivedAt":100');
+    expect(toolHandlers.loadTask).toHaveBeenCalledWith(archivedTask.id, expect.any(AbortSignal));
+    expect(liveBoard.tasks).toEqual([]);
+  });
+
+  it("does not label lease-renewing assignment tools as read-only", async () => {
+    const registry = new Registry();
+    await registerBoardTools(registry, handlers(board(task("in_pr", true))), new AbortController().signal);
+
+    expect(registry.tools.get("list_tasks")?.annotations?.readOnlyHint).toBe(true);
+    for (const name of ["inspect_task", "read_pull_request", "read_review", "check_status"]) {
+      expect(registry.tools.get(name)?.annotations?.readOnlyHint, name).toBe(false);
+    }
+  });
+
+  it.each(["ready", "in_progress"] satisfies TaskColumn[])("marks %s plan reads as lease-renewing", async (column) => {
+    const registry = new Registry();
+    await registerBoardTools(registry, handlers(board(task(column, true))), new AbortController().signal);
+    expect(registry.tools.get("read_plan")?.annotations?.readOnlyHint).toBe(false);
   });
 });

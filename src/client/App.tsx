@@ -167,6 +167,16 @@ export function App(): ReactNode {
     return next;
   }, [setCurrentBoard]);
 
+  const loadTask = useCallback(async (taskId: string, signal?: AbortSignal): Promise<TaskView | null> => {
+    const current = boardRef.current;
+    if (!current) throw new Error("No board is open");
+    const visible = current.tasks.find((task) => task.id === taskId);
+    if (visible) return visible;
+    if (!current.viewer.canMutate) return null;
+    const history = await getBoard(current.owner, current.repo, true, signal);
+    return history.tasks.find((task) => task.id === taskId) ?? null;
+  }, []);
+
   const runCommand = useCallback(async (command: BoardCommand, signal?: AbortSignal): Promise<BoardView> => {
     const current = boardRef.current;
     if (!current) throw new Error("No board is open");
@@ -272,6 +282,7 @@ export function App(): ReactNode {
         getBoard: () => boardRef.current!,
         getSelectedTaskId: () => selectedTaskRef.current,
         getActiveAssignmentId: () => activeAssignmentRef.current,
+        loadTask: (taskId, signal) => loadTask(taskId, signal),
         runCommand: (command, signal) => runCommand(command, signal),
         refreshPullRequest: (taskId, signal) => refreshPr(taskId, signal),
         confirmArchive,
@@ -281,7 +292,7 @@ export function App(): ReactNode {
       if (!controller.signal.aborted) setError(messageFor(caught));
     });
     return () => controller.abort();
-  }, [confirmArchive, refreshPr, registrationProfileKey, runCommand]);
+  }, [confirmArchive, loadTask, refreshPr, registrationProfileKey, runCommand]);
 
   useEffect(() => {
     if (!board?.tasks.some((task) => task.column === "in_pr")) return;

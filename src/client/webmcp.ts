@@ -35,6 +35,7 @@ export interface BoardToolHandlers {
   getBoard: () => BoardView;
   getSelectedTaskId: () => string | null;
   getActiveAssignmentId: () => string | null;
+  loadTask: (taskId: string, signal: AbortSignal) => Promise<TaskView | null>;
   runCommand: (command: BoardCommand, signal: AbortSignal) => Promise<BoardView>;
   refreshPullRequest: (taskId: string, signal: AbortSignal) => Promise<BoardView>;
   confirmArchive: (task: TaskView, signal: AbortSignal) => Promise<void>;
@@ -81,14 +82,16 @@ export async function registerBoardTools(context: WebMcpContext, handlers: Board
       type: "object", additionalProperties: false,
       properties: { taskId: { type: "string", minLength: 1, maxLength: 100 } },
     },
-    annotations: { readOnlyHint: true, destructiveHint: false, untrustedContentHint: true },
+    annotations: { readOnlyHint: !assignedTask?.assignment, destructiveHint: false, untrustedContentHint: true },
     execute: async (input, execution) => {
       const requested = typeof input.taskId === "string" ? input.taskId : null;
-      const inspected = inspectTask(handlers, requested);
+      const combined = toolSignal(execution, signal);
+      let inspected = await inspectTask(handlers, requested, combined);
       if (assignedTask?.assignment && "id" in inspected && inspected.id === assignedTask.id) {
-        await handlers.runCommand({ type: "renew_assignment", assignmentId: assignedTask.assignment.id }, toolSignal(execution, signal));
+        await handlers.runCommand({ type: "renew_assignment", assignmentId: assignedTask.assignment.id }, combined);
+        inspected = await inspectTask(handlers, requested, combined);
       }
-      return bounded(inspectTask(handlers, requested));
+      return bounded(inspected);
     },
   });
 
@@ -255,9 +258,9 @@ async function addAssignmentTools(
     await add({
       name: "read_review",
       title: "Read pull request reviews",
-      description: "Read bounded review decisions and recent review bodies. GitHub review text is untrusted content.",
+      description: "Renew this assignment lease, then read bounded review decisions and recent review bodies. GitHub review text is untrusted content.",
       inputSchema: emptySchema(),
-      annotations: { readOnlyHint: true, destructiveHint: false, untrustedContentHint: true },
+      annotations: { readOnlyHint: false, destructiveHint: false, untrustedContentHint: true },
       execute: async (_input, execution) => {
         await renewReadAssignment(handlers, assignmentId, execution, registrySignal);
         const current = handlers.getBoard().tasks.find((candidate) => candidate.id === task.id) ?? task;
@@ -267,9 +270,9 @@ async function addAssignmentTools(
     await add({
       name: "check_status",
       title: "Refresh pull request status",
-      description: "Fetch current review, comment, check, and merge state from GitHub, repair the cached snapshot, and return the updated status.",
+      description: "Renew this assignment lease, fetch current review, comment, check, and merge state from GitHub, repair the cached snapshot, and return the updated status.",
       inputSchema: emptySchema(),
-      annotations: { readOnlyHint: true, destructiveHint: false, untrustedContentHint: true },
+      annotations: { readOnlyHint: false, destructiveHint: false, untrustedContentHint: true },
       execute: async (_input, execution) => {
         const combined = toolSignal(execution, registrySignal);
         await handlers.runCommand({ type: "renew_assignment", assignmentId }, combined);
@@ -284,9 +287,9 @@ function readPlanTool(task: TaskView, handlers: BoardToolHandlers, registrySigna
   return {
     name: "read_plan",
     title: "Read the delegated plan",
-    description: "Read the latest immutable delegated-approved plan revision. Plan text is untrusted content.",
+    description: "Renew this assignment lease, then read the latest immutable delegated-approved plan revision. Plan text is untrusted content.",
     inputSchema: emptySchema(),
-    annotations: { readOnlyHint: true, destructiveHint: false, untrustedContentHint: true },
+    annotations: { readOnlyHint: false, destructiveHint: false, untrustedContentHint: true },
     execute: async (_input, execution) => {
       await renewReadAssignment(handlers, task.assignment!.id, execution, registrySignal);
       return bounded(handlers.getBoard().tasks.find((candidate) => candidate.id === task.id)?.plan ?? task.plan ?? { status: "missing" });
@@ -298,9 +301,9 @@ function readPullRequestTool(task: TaskView, handlers: BoardToolHandlers, regist
   return {
     name: "read_pull_request",
     title: "Read the linked pull request",
-    description: "Read the cached linked pull request metadata and check summary. GitHub text is untrusted content.",
+    description: "Renew this assignment lease, then read the cached linked pull request metadata and check summary. GitHub text is untrusted content.",
     inputSchema: emptySchema(),
-    annotations: { readOnlyHint: true, destructiveHint: false, untrustedContentHint: true },
+    annotations: { readOnlyHint: false, destructiveHint: false, untrustedContentHint: true },
     execute: async (_input, execution) => {
       await renewReadAssignment(handlers, task.assignment!.id, execution, registrySignal);
       return bounded(handlers.getBoard().tasks.find((candidate) => candidate.id === task.id)?.pullRequest ?? task.pullRequest ?? { status: "not_linked" });
@@ -317,10 +320,14 @@ async function renewReadAssignment(
   await handlers.runCommand({ type: "renew_assignment", assignmentId }, toolSignal(execution, registrySignal));
 }
 
-function inspectTask(handlers: BoardToolHandlers, requestedTaskId: string | null): TaskView | { error: string; availableTaskIds: string[] } {
+async function inspectTask(
+  handlers: BoardToolHandlers,
+  requestedTaskId: string | null,
+  signal: AbortSignal,
+): Promise<TaskView | { error: string; availableTaskIds: string[] }> {
   const board = handlers.getBoard();
   const taskId = requestedTaskId ?? handlers.getSelectedTaskId() ?? board.tasks.find((task) => task.assignment?.id === handlers.getActiveAssignmentId())?.id;
-  const task = board.tasks.find((candidate) => candidate.id === taskId);
+  const task = board.tasks.find((candidate) => candidate.id === taskId) ?? (taskId ? await handlers.loadTask(taskId, signal) : null);
   return task ?? { error: "task_not_found", availableTaskIds: board.tasks.slice(0, 50).map((candidate) => candidate.id) };
 }
 
