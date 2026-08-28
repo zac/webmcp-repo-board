@@ -1,7 +1,7 @@
 import { SELF, applyD1Migrations, env, reset, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { BoardView } from "../shared";
-import { createOAuthState, createSession, sessionCookie, userFromRequest, verifyOAuthState } from "./auth";
+import { createOAuthState, createSession, oauthReturnPath, safeOAuthReturnPath, sessionCookie, userFromRequest, verifyOAuthState } from "./auth";
 
 const testEnv = env as Env & { TEST_MIGRATIONS: D1Migration[] };
 
@@ -29,6 +29,39 @@ function authenticated(role: string, userId = "user-zac", login = "zac", init: R
 }
 
 describe("Worker authorization and directory routing", () => {
+  it("shows an unpersisted blank board for any public repository route", async () => {
+    const response = await SELF.fetch("https://example.com/api/boards/acme/new-public", { headers: { "x-test-repository-visibility": "public" } });
+    expect(response.status).toBe(200);
+    expect(await response.json() as BoardView).toMatchObject({
+      fullName: "acme/new-public",
+      materialized: false,
+      revision: 0,
+      tasks: [],
+      viewer: { canMutate: false },
+    });
+    expect((await env.DIRECTORY.prepare("SELECT COUNT(*) AS count FROM boards").first<{ count: number }>())?.count).toBe(0);
+  });
+
+  it("materializes a direct-route board only for a signed-in mutating collaborator", async () => {
+    const url = "https://example.com/api/boards/acme/lazy";
+    const preview = await SELF.fetch(url, authenticated("read", "reader", "reader", { headers: { "x-test-repository-visibility": "public" } }));
+    expect((await preview.json() as BoardView).materialized).toBe(false);
+    expect((await env.DIRECTORY.prepare("SELECT COUNT(*) AS count FROM boards").first<{ count: number }>())?.count).toBe(0);
+
+    const initialized = await SELF.fetch(url, authenticated("triage", "author", "author", { headers: { "x-test-repository-visibility": "public" } }));
+    expect(initialized.status).toBe(200);
+    expect(await initialized.json() as BoardView).toMatchObject({ materialized: true, viewer: { roleName: "triage", canMutate: true } });
+    expect((await env.DIRECTORY.prepare("SELECT COUNT(*) AS count FROM boards").first<{ count: number }>())?.count).toBe(1);
+  });
+
+  it("keeps private and nonexistent direct routes indistinguishable before sign-in", async () => {
+    const privateResponse = await SELF.fetch("https://example.com/api/boards/acme/private-route", { headers: { "x-test-repository-visibility": "private" } });
+    const missingResponse = await SELF.fetch("https://example.com/api/boards/acme/missing-route");
+    expect(privateResponse.status).toBe(404);
+    expect(missingResponse.status).toBe(404);
+    expect(await privateResponse.json()).toEqual(await missingResponse.json());
+  });
+
   it("allows anonymous public reads and hides private boards", async () => {
     await seedBoard("public", false);
     await seedBoard("private", true);
@@ -103,11 +136,15 @@ describe("sessions and OAuth state", () => {
 
   it("accepts only the OAuth state bound to its HttpOnly cookie", () => {
     const url = new URL("https://example.com/auth/github");
-    const { state, cookie } = createOAuthState(url);
+    const { state, cookie, returnCookie } = createOAuthState(url, "/boards/zac/repo-board");
     expect(cookie).toContain("HttpOnly");
     expect(cookie).toContain("Secure");
     expect(verifyOAuthState(new Request(url, { headers: { cookie } }), state)).toBe(true);
     expect(verifyOAuthState(new Request(url, { headers: { cookie } }), `${state}x`)).toBe(false);
     expect(verifyOAuthState(new Request(url), state)).toBe(false);
+    const request = new Request(url, { headers: { cookie: `${cookie.split(";")[0]}; ${returnCookie.split(";")[0]}` } });
+    expect(oauthReturnPath(request)).toBe("/boards/zac/repo-board");
+    expect(safeOAuthReturnPath("https://attacker.example/boards/zac/repo-board")).toBe("/");
+    expect(safeOAuthReturnPath("/boards/zac/repo-board?next=https://attacker.example")).toBe("/");
   });
 });

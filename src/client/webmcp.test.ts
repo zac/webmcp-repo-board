@@ -73,6 +73,7 @@ function board(taskValue: TaskView, canMutate = true): BoardView {
     fullName: "acme/widgets",
     htmlUrl: "https://github.com/acme/widgets",
     isPrivate: false,
+    materialized: true,
     revision: 3,
     viewer: { userId: canMutate ? "u1" : null, login: canMutate ? "zac" : null, avatarUrl: null, roleName: canMutate ? "write" : null, canMutate },
     tasks: [taskValue],

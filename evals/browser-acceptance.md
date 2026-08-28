@@ -5,8 +5,9 @@ This run is designed to fit under three minutes after the local Worker is runnin
 ## Setup
 
 1. Run `pnpm d1:migrate:local` and `pnpm dev:worker`.
-2. Open `http://localhost:8787` in two browser contexts that support `document.modelContext`.
-3. Use the development session, create the same repository board, and create one Todo ticket.
+2. Open `/boards/octocat/Spoon-Knife` while signed out. Confirm the empty revision-0 preview has only `list_tasks` and `inspect_task`, then verify D1 still has no board row.
+3. Open a private or nonexistent repository route. Confirm both produce the same sign-in gate over an empty board shell.
+4. Sign in from the public route and confirm OAuth returns to the same path. Use the development session locally; the authenticated route materializes the board. Open it in a second browser context that supports `document.modelContext`, then create one Todo ticket.
 
 ## Acceptance sequence
 

@@ -4,17 +4,20 @@ import {
   parseCommandEnvelope,
   type Actor,
   type BoardSummary,
+  type BoardView,
   type CommandEnvelope,
   type InternalBoardCommand,
   type RpcResult,
   type Viewer,
 } from "../shared";
 import {
+  clearOAuthReturnCookie,
   clearOAuthStateCookie,
   clearSessionCookie,
   createOAuthState,
   createSession,
   deleteSession,
+  oauthReturnPath,
   sessionCookie,
   userFromRequest,
   verifyOAuthState,
@@ -35,6 +38,7 @@ import {
   parsePullRequestUrl,
   readBoundedBody,
   verifyWebhookSignature,
+  type GitHubRepository,
 } from "./github";
 import { RepoBoard } from "./repo-board";
 
@@ -117,7 +121,10 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     const repo = decodeRepoPart(match[2]);
     const operation = match[3] ?? "view";
     const board = await boardRecord(env, owner, repo);
-    if (!board) throw new RequestError("board_not_found", "Repository board was not found", 404);
+    if (!board && operation === "view" && request.method === "GET") {
+      return Response.json(await resolveDirectBoard(request, env, ctx, url, owner, repo));
+    }
+    if (!board) throw repositoryUnavailable();
     const authorization = await authorizeBoard(request, env, board);
 
     if (operation === "view" && request.method === "GET") {
@@ -146,13 +153,16 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
 function startOAuth(url: URL, env: Env): Response {
   if (!env.GITHUB_APP_CLIENT_ID || env.GITHUB_APP_CLIENT_ID.startsWith("replace-")) throw new RequestError("github_app_not_configured", "GitHub App client ID is not configured", 503);
-  const { state, cookie } = createOAuthState(url);
+  const { state, cookie, returnCookie } = createOAuthState(url, url.searchParams.get("returnTo") ?? "/");
   const callback = `${url.origin}/auth/callback`;
   const target = new URL("https://github.com/login/oauth/authorize");
   target.searchParams.set("client_id", env.GITHUB_APP_CLIENT_ID);
   target.searchParams.set("redirect_uri", callback);
   target.searchParams.set("state", state);
-  return new Response(null, { status: 302, headers: { location: target.toString(), "set-cookie": cookie } });
+  const headers = new Headers({ location: target.toString() });
+  headers.append("set-cookie", cookie);
+  headers.append("set-cookie", returnCookie);
+  return new Response(null, { status: 302, headers });
 }
 
 async function finishOAuth(request: Request, url: URL, env: Env): Promise<Response> {
@@ -162,9 +172,10 @@ async function finishOAuth(request: Request, url: URL, env: Env): Promise<Respon
   const token = await exchangeOAuthCode(env, code, `${url.origin}/auth/callback`);
   const identity = await fetchGitHubIdentity(token);
   const created = await createSession(env, identity);
-  const headers = new Headers({ location: "/" });
+  const headers = new Headers({ location: oauthReturnPath(request) });
   headers.append("set-cookie", sessionCookie(created.token, url));
   headers.append("set-cookie", clearOAuthStateCookie(url));
+  headers.append("set-cookie", clearOAuthReturnCookie(url));
   return new Response(null, { status: 302, headers });
 }
 
@@ -208,7 +219,67 @@ async function createBoard(request: Request, env: Env, url: URL): Promise<Respon
     roleName = await collaboratorRole(owner, repo, user.login, token);
   }
   if (!canMutateForRole(roleName)) throw new RequestError("forbidden", "Repository triage access is required to create its board", 403);
+  const board = await materializeBoard(env, repository, installationId, user);
+  return Response.json({ ...boardSummary(board), roleName }, { status: 201 });
+}
 
+async function resolveDirectBoard(request: Request, env: Env, ctx: ExecutionContext, url: URL, owner: string, repo: string): Promise<BoardView> {
+  const user = await userFromRequest(request, env);
+
+  if (String(env.ENVIRONMENT) === "test") {
+    const visibility = request.headers.get("x-test-repository-visibility");
+    if (visibility !== "public" && visibility !== "private") throw repositoryUnavailable();
+    const repository = syntheticRepository(owner, repo, visibility === "private");
+    if (!user) {
+      if (repository.isPrivate) throw repositoryUnavailable();
+      return virtualBoard(repository, viewerFor(null, null, false));
+    }
+    const roleName = request.headers.get("x-test-role") ?? "read";
+    if (repository.isPrivate && !canReadForRole(roleName)) throw repositoryUnavailable();
+    const viewer = viewerFor(user, roleName, canMutateForRole(roleName));
+    if (!viewer.canMutate) return virtualBoard(repository, viewer);
+    const board = await materializeBoard(env, repository, 0, user);
+    return unwrap(await boardStub(env, board.id).getView(viewer, false));
+  }
+
+  if (isLocal(url)) {
+    const repository = syntheticRepository(owner, repo, false);
+    if (!user) return virtualBoard(repository, viewerFor(null, null, false));
+    const viewer = viewerFor(user, "admin", true);
+    const board = await materializeBoard(env, repository, 0, user);
+    return unwrap(await boardStub(env, board.id).getView(viewer, false));
+  }
+
+  if (!user) {
+    return virtualBoard(await fetchPublicRepositoryCached(env, ctx, owner, repo), viewerFor(null, null, false));
+  }
+
+  let installationId: number;
+  let repository: GitHubRepository;
+  let roleName: string | null;
+  try {
+    installationId = await appInstallationForRepository(env, owner, repo);
+    const token = await installationToken(env, installationId);
+    if (!token) throw new GitHubError("installation_missing", "GitHub installation is unavailable", 404);
+    repository = await fetchRepository(owner, repo, token);
+    roleName = await collaboratorRole(repository.owner, repository.repo, user.login, token);
+  } catch {
+    try {
+      repository = await fetchPublicRepositoryCached(env, ctx, owner, repo);
+      roleName = null;
+      installationId = 0;
+    } catch {
+      throw repositoryUnavailable();
+    }
+  }
+  if (repository.isPrivate && !canReadForRole(roleName)) throw repositoryUnavailable();
+  const viewer = viewerFor(user, roleName, canMutateForRole(roleName));
+  if (!viewer.canMutate) return virtualBoard(repository, viewer);
+  const board = await materializeBoard(env, repository, installationId, user);
+  return unwrap(await boardStub(env, board.id).getView(viewer, false));
+}
+
+async function materializeBoard(env: Env, repository: GitHubRepository, installationId: number, user: AuthenticatedUser): Promise<BoardRecord> {
   const now = Date.now();
   const id = repository.fullName.toLowerCase();
   await env.DIRECTORY.batch([
@@ -219,11 +290,55 @@ async function createBoard(request: Request, env: Env, url: URL): Promise<Respon
     ).bind(installationId, repository.owner, now),
     env.DIRECTORY.prepare(
       `INSERT INTO boards (id, owner, repo, full_name, repository_id, installation_id, is_private, html_url, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT DO NOTHING`,
     ).bind(id, repository.owner, repository.repo, repository.fullName, repository.id, installationId, repository.isPrivate ? 1 : 0, repository.htmlUrl, user.userId, now, now),
   ]);
-  await boardStub(env, id).initialize({ id, owner: repository.owner, repo: repository.repo, fullName: repository.fullName, htmlUrl: repository.htmlUrl, isPrivate: repository.isPrivate });
-  return Response.json({ ...boardSummary({ id, owner: repository.owner, repo: repository.repo, full_name: repository.fullName, repository_id: repository.id, installation_id: installationId, is_private: repository.isPrivate ? 1 : 0, html_url: repository.htmlUrl }), roleName }, { status: 201 });
+  const board = await boardRecord(env, repository.owner, repository.repo);
+  if (!board) throw new RequestError("board_initialization_failed", "Repository board could not be initialized", 500);
+  await boardStub(env, board.id).initialize({ id: board.id, owner: board.owner, repo: board.repo, fullName: board.full_name, htmlUrl: board.html_url, isPrivate: Boolean(board.is_private) });
+  return board;
+}
+
+async function fetchPublicRepositoryCached(env: Env, ctx: ExecutionContext, owner: string, repo: string): Promise<GitHubRepository> {
+  const cacheKey = new Request(`https://repo-board-cache.invalid/repositories/${encodeURIComponent(owner.toLowerCase())}/${encodeURIComponent(repo.toLowerCase())}`);
+  const cached = await caches.default.match(cacheKey);
+  if (cached) return await cached.json<GitHubRepository>();
+  try {
+    const repository = await fetchRepository(owner, repo, null);
+    const response = Response.json(repository, { headers: { "cache-control": "public, max-age=300" } });
+    ctx.waitUntil(caches.default.put(cacheKey, response));
+    return repository;
+  } catch (error) {
+    if (error instanceof GitHubError && error.status === 404) throw repositoryUnavailable();
+    throw error;
+  }
+}
+
+function syntheticRepository(owner: string, repo: string, isPrivate: boolean): GitHubRepository {
+  const fullName = `${owner}/${repo}`;
+  let hash = 0;
+  for (const character of fullName.toLowerCase()) hash = ((hash << 5) - hash + character.charCodeAt(0)) | 0;
+  return { id: -Math.max(1, Math.abs(hash)), owner, repo, fullName, htmlUrl: `https://github.com/${fullName}`, isPrivate };
+}
+
+function virtualBoard(repository: GitHubRepository, viewer: Viewer): BoardView {
+  return {
+    id: repository.fullName.toLowerCase(),
+    owner: repository.owner,
+    repo: repository.repo,
+    fullName: repository.fullName,
+    htmlUrl: repository.htmlUrl,
+    isPrivate: repository.isPrivate,
+    materialized: false,
+    revision: 0,
+    viewer,
+    tasks: [],
+  };
+}
+
+function repositoryUnavailable(): RequestError {
+  return new RequestError("repository_unavailable", "This repository may be private or may not exist", 404);
 }
 
 async function executeCommand(request: Request, env: Env, board: BoardRecord, user: AuthenticatedUser, viewer: Viewer): Promise<Response> {

@@ -10,7 +10,6 @@ import {
 import {
   ApiError,
   boardSocketUrl,
-  createBoard,
   createDevelopmentSession,
   executeCommand,
   getBoard,
@@ -43,13 +42,14 @@ export function App(): ReactNode {
   const [user, setUser] = useState<SessionUser | null>(null);
   const [boards, setBoards] = useState<BoardSummary[]>([]);
   const [board, setBoard] = useState<BoardView | null>(null);
+  const [unavailableRoute, setUnavailableRoute] = useState<{ owner: string; repo: string } | null>(null);
   const boardRef = useRef<BoardView | null>(null);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const selectedTaskRef = useRef<string | null>(null);
   const [activeAssignmentId, setActiveAssignmentIdState] = useState<string | null>(null);
   const activeAssignmentRef = useRef<string | null>(null);
   const [toolNames, setToolNames] = useState<string[]>([]);
-  const [realtime, setRealtime] = useState<"connecting" | "live" | "offline">("offline");
+  const [realtime, setRealtime] = useState<"connecting" | "live" | "offline" | "preview">("offline");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
@@ -113,9 +113,21 @@ export function App(): ReactNode {
     const route = boardRoute(window.location.pathname);
     if (!route) {
       setCurrentBoard(null);
+      setUnavailableRoute(null);
       return;
     }
-    const next = await getBoard(route.owner, route.repo, false, signal);
+    let next: BoardView;
+    try {
+      next = await getBoard(route.owner, route.repo, false, signal);
+    } catch (caught) {
+      if (caught instanceof ApiError && caught.code === "repository_unavailable") {
+        setCurrentBoard(null);
+        setUnavailableRoute(route);
+        return;
+      }
+      throw caught;
+    }
+    setUnavailableRoute(null);
     setCurrentBoard(next);
     const storedAssignment = sessionStorage.getItem(assignmentStorageKey(next.id));
     setActiveAssignmentId(storedAssignment);
@@ -195,6 +207,10 @@ export function App(): ReactNode {
       setRealtime("offline");
       return;
     }
+    if (!board.materialized) {
+      setRealtime("preview");
+      return;
+    }
     let disposed = false;
     let socket: WebSocket | null = null;
     let reconnectTimer = 0;
@@ -228,7 +244,7 @@ export function App(): ReactNode {
       window.clearTimeout(refreshTimer);
       socket?.close();
     };
-  }, [board?.id, setCurrentBoard]);
+  }, [board?.id, board?.materialized, setCurrentBoard]);
 
   useEffect(() => {
     if (!board) return;
@@ -270,8 +286,8 @@ export function App(): ReactNode {
     return () => window.clearInterval(interval);
   }, [board?.id, board?.tasks.some((task) => task.column === "in_pr"), refreshPr]);
 
-  const navigateBoard = useCallback(async (summary: BoardSummary) => {
-    history.pushState({}, "", `/boards/${encodeURIComponent(summary.owner)}/${encodeURIComponent(summary.repo)}`);
+  const navigateRepository = useCallback(async (owner: string, repo: string) => {
+    history.pushState({}, "", `/boards/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`);
     setLoading(true);
     setError(null);
     try {
@@ -283,9 +299,12 @@ export function App(): ReactNode {
     }
   }, [openFromLocation]);
 
+  const navigateBoard = useCallback((summary: BoardSummary) => navigateRepository(summary.owner, summary.repo), [navigateRepository]);
+
   const navigateHome = useCallback(() => {
     history.pushState({}, "", "/");
     setCurrentBoard(null);
+    setUnavailableRoute(null);
     setSelected(null);
     setActiveAssignmentIdState(null);
   }, [setCurrentBoard, setSelected]);
@@ -313,6 +332,8 @@ export function App(): ReactNode {
       {board ? (
         <BoardPage
           board={board}
+          config={config}
+          user={user}
           selectedTaskId={selectedTaskId}
           activeAssignmentId={activeAssignmentId}
           realtime={realtime}
@@ -337,6 +358,21 @@ export function App(): ReactNode {
             catch (caught) { setError(messageFor(caught)); }
           }}
           onArchive={(task) => setArchiveRequest({ task, resolve: () => void runCommand({ type: "archive_task", taskId: task.id }).then(() => setToast("Task archived")).catch((caught) => setError(messageFor(caught))), reject: () => undefined })}
+          onDevelopmentLogin={async () => {
+            try { setUser(await createDevelopmentSession()); await refreshDirectory(); await openFromLocation(); }
+            catch (caught) { setError(messageFor(caught)); }
+          }}
+        />
+      ) : unavailableRoute ? (
+        <RepositoryGate
+          route={unavailableRoute}
+          config={config}
+          user={user}
+          onBack={navigateHome}
+          onDevelopmentLogin={async () => {
+            try { setUser(await createDevelopmentSession()); await refreshDirectory(); await openFromLocation(); }
+            catch (caught) { setError(messageFor(caught)); }
+          }}
         />
       ) : (
         <BoardIndex
@@ -349,13 +385,7 @@ export function App(): ReactNode {
             catch (caught) { setError(messageFor(caught)); }
           }}
           onLogout={async () => { await logout(); setUser(null); await refreshDirectory(); }}
-          onCreate={async (owner, repo) => {
-            try {
-              const created = await createBoard(owner, repo);
-              await refreshDirectory();
-              await navigateBoard(created);
-            } catch (caught) { setError(messageFor(caught)); }
-          }}
+          onNavigate={navigateRepository}
         />
       )}
 
@@ -382,7 +412,7 @@ function BoardIndex(props: {
   onOpen: (board: BoardSummary) => void;
   onDevelopmentLogin: () => void;
   onLogout: () => void;
-  onCreate: (owner: string, repo: string) => void;
+  onNavigate: (owner: string, repo: string) => void;
 }): ReactNode {
   const [owner, setOwner] = useState("");
   const [repo, setRepo] = useState("");
@@ -408,28 +438,55 @@ function BoardIndex(props: {
               <span><strong>{board.fullName}</strong><small>{board.isPrivate ? "Private repository" : "Public board"}</small></span>
               <span className="row-arrow" aria-hidden="true">↗</span>
             </button>
-          )) : <div className="empty-index"><strong>No boards yet.</strong><p>Connect a repository to create the first one.</p></div>}
+          )) : <div className="empty-index"><strong>No materialized boards yet.</strong><p>Open any public repository path to preview its empty board.</p></div>}
         </section>
         <aside className="connect-panel">
-          {props.user ? (
-            <form onSubmit={(event) => { event.preventDefault(); props.onCreate(owner, repo); }}>
-              <p className="eyebrow">Connect a repository</p>
-              <h2>Start with GitHub authority.</h2>
-              <label>Owner<input value={owner} onChange={(event) => setOwner(event.target.value)} placeholder="octocat" required pattern="[A-Za-z0-9_.-]+" /></label>
-              <label>Repository<input value={repo} onChange={(event) => setRepo(event.target.value)} placeholder="hello-world" required pattern="[A-Za-z0-9_.-]+" /></label>
-              <button className="primary-button" type="submit">Create repository board</button>
-              <a className="install-link" href={props.config?.githubInstallUrl} target="_blank" rel="noreferrer">Install the read-only GitHub App first ↗</a>
-            </form>
-          ) : (
-            <div>
-              <p className="eyebrow">Write access</p>
-              <h2>Sign in to claim work.</h2>
-              <p>Public boards stay readable. GitHub collaborator roles decide who can create, claim, move, and archive tasks.</p>
-              <a className="primary-button link-button" href={props.config?.githubLoginUrl ?? "/auth/github"}>Sign in with GitHub</a>
-              {props.config?.localDevelopment && <button className="secondary-button" onClick={props.onDevelopmentLogin}>Use local development session</button>}
-            </div>
-          )}
+          <form onSubmit={(event) => { event.preventDefault(); props.onNavigate(owner, repo); }}>
+            <p className="eyebrow">Open any repository</p>
+            <h2>Start with its GitHub path.</h2>
+            <p>Public repositories open as blank previews until an authorized collaborator signs in.</p>
+            <label>Owner<input value={owner} onChange={(event) => setOwner(event.target.value)} placeholder="octocat" required pattern="[A-Za-z0-9_.-]+" /></label>
+            <label>Repository<input value={repo} onChange={(event) => setRepo(event.target.value)} placeholder="hello-world" required pattern="[A-Za-z0-9_.-]+" /></label>
+            <button className="primary-button" type="submit">Open repository board</button>
+            {!props.user && <a className="install-link" href={props.config?.githubLoginUrl ?? "/auth/github"}>Sign in with GitHub</a>}
+            {props.config?.localDevelopment && !props.user && <button className="secondary-button" type="button" onClick={props.onDevelopmentLogin}>Use local development session</button>}
+          </form>
         </aside>
+      </div>
+    </main>
+  );
+}
+
+function RepositoryGate(props: {
+  route: { owner: string; repo: string };
+  config: AppConfig | null;
+  user: SessionUser | null;
+  onBack: () => void;
+  onDevelopmentLogin: () => void;
+}): ReactNode {
+  const fullName = `${props.route.owner}/${props.route.repo}`;
+  return (
+    <main className="board-page repository-gate">
+      <header className="board-header">
+        <button className="back-button" onClick={props.onBack} aria-label="Back to repositories">←</button>
+        <div className="board-identity"><Wordmark compact /><span className="identity-divider" /><span className="gate-repository">{fullName}</span></div>
+      </header>
+      <section className="board-context"><div><p className="eyebrow">Repository board</p><h1>{fullName}</h1></div></section>
+      <section className="kanban gate-board" aria-hidden="true">
+        {TASK_COLUMNS.map((column) => <div className="kanban-column" data-column={column} key={column}><header><div><span className="column-signal" /><h2>{COLUMN_COPY[column].label}</h2></div><strong>0</strong><p>{COLUMN_COPY[column].short}</p></header></div>)}
+      </section>
+      <div className="gate-overlay">
+        <section className="gate-dialog" role="dialog" aria-modal="true" aria-labelledby="repository-gate-title">
+          <p className="eyebrow">Private or unavailable</p>
+          <h2 id="repository-gate-title">We can’t tell whether this repository exists.</h2>
+          <p>It may be private, missing, or outside this GitHub App installation. Sign in to let GitHub verify your access without revealing private repository names.</p>
+          <div className="gate-actions">
+            {!props.user && <a className="primary-button link-button" href={loginUrl(props.config)}>Sign in with GitHub</a>}
+            {props.user && <a className="primary-button link-button" href={props.config?.githubInstallUrl} target="_blank" rel="noreferrer">Configure GitHub App ↗</a>}
+            {props.user && <button className="secondary-button" onClick={() => window.location.reload()}>Check again</button>}
+            {!props.user && props.config?.localDevelopment && <button className="secondary-button" onClick={props.onDevelopmentLogin}>Use local session</button>}
+          </div>
+        </section>
       </div>
     </main>
   );
@@ -437,9 +494,11 @@ function BoardIndex(props: {
 
 function BoardPage(props: {
   board: BoardView;
+  config: AppConfig | null;
+  user: SessionUser | null;
   selectedTaskId: string | null;
   activeAssignmentId: string | null;
-  realtime: "connecting" | "live" | "offline";
+  realtime: "connecting" | "live" | "offline" | "preview";
   toolNames: string[];
   onBack: () => void;
   onSelect: (id: string | null) => void;
@@ -450,11 +509,12 @@ function BoardPage(props: {
   onRelease: (assignmentId: string) => void;
   onRefreshPr: (taskId: string) => void;
   onArchive: (task: TaskView) => void;
+  onDevelopmentLogin: () => void;
 }): ReactNode {
   const selected = props.board.tasks.find((task) => task.id === props.selectedTaskId) ?? null;
   const counts = useMemo(() => Object.fromEntries(TASK_COLUMNS.map((column) => [column, props.board.tasks.filter((task) => task.column === column).length])) as Record<TaskColumn, number>, [props.board.tasks]);
   return (
-    <main className={`board-page${selected ? " has-drawer" : ""}`}>
+    <main className={`board-page${selected ? " has-drawer" : ""}${props.board.materialized ? "" : " has-preview"}`}>
       <header className="board-header">
         <button className="back-button" onClick={props.onBack} aria-label="Back to repositories">←</button>
         <div className="board-identity">
@@ -473,6 +533,14 @@ function BoardPage(props: {
         <div><p className="eyebrow">Live repository queue</p><h1>{props.board.fullName}</h1></div>
         <p>Revision <strong>{props.board.revision}</strong> · {props.board.viewer.login ? `signed in as @${props.board.viewer.login}` : "public read-only view"}</p>
       </section>
+      {!props.board.materialized && (
+        <section className="preview-banner" aria-label="Board preview status">
+          <div><strong>This is a blank repository preview.</strong><span>{previewExplanation(props.board, props.user)}</span></div>
+          {!props.user && <a className="primary-button link-button" href={loginUrl(props.config)}>Sign in to initialize</a>}
+          {props.user && <a className="secondary-button link-button" href={props.config?.githubInstallUrl} target="_blank" rel="noreferrer">Install or configure GitHub App ↗</a>}
+          {!props.user && props.config?.localDevelopment && <button className="secondary-button" onClick={props.onDevelopmentLogin}>Use local session</button>}
+        </section>
+      )}
       <section className="kanban" aria-label="Repository task board">
         {TASK_COLUMNS.map((column) => (
           <div className="kanban-column" data-column={column} key={column}>
@@ -625,6 +693,18 @@ function Notice({ kind, onClose, children }: { kind: "error" | "success"; onClos
 function boardRoute(pathname: string): { owner: string; repo: string } | null {
   const match = /^\/boards\/([^/]+)\/([^/]+)\/?$/.exec(pathname);
   return match ? { owner: decodeURIComponent(match[1]), repo: decodeURIComponent(match[2]) } : null;
+}
+
+function loginUrl(config: AppConfig | null): string {
+  const target = new URL(config?.githubLoginUrl ?? "/auth/github", window.location.origin);
+  target.searchParams.set("returnTo", window.location.pathname);
+  return `${target.pathname}${target.search}`;
+}
+
+function previewExplanation(board: BoardView, user: SessionUser | null): string {
+  if (!user) return "No durable board has been created. A collaborator with triage access can sign in to initialize it.";
+  if (board.viewer.roleName) return `Your @${user.login} account has ${board.viewer.roleName} access, which is read-only for Repo Board.`;
+  return "Install or grant the read-only GitHub App access to this repository, then reload so Repo Board can verify your collaborator role.";
 }
 
 function assignmentStorageKey(boardId: string): string { return `repo-board:${boardId}:assignment`; }

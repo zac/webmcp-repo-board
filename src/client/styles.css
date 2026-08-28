@@ -101,10 +101,12 @@ textarea { resize: vertical; padding: 12px; line-height: 1.5; }
 .live-state i { width: 7px; height: 7px; border-radius: 50%; background: var(--line-dark); }
 .live-state.live i { background: #35a36f; box-shadow: 0 0 0 4px rgb(53 163 111 / 12%); }
 .live-state.connecting i { background: #e1a12d; }
+.live-state.preview i { background: var(--cobalt); }
 .board-context { min-height: 100px; display: flex; align-items: end; justify-content: space-between; gap: 30px; padding: 22px 24px 18px; border-bottom: 1px solid var(--line-dark); }
 .board-context h1 { margin: 0; font: 650 1.8rem/1.1 "SF Pro Rounded", "Arial Rounded MT Bold", sans-serif; letter-spacing: -.045em; }
 .board-context > p { margin: 0 0 3px; color: var(--muted); font: .68rem/1.4 "SFMono-Regular", monospace; }
 .kanban { height: calc(100vh - 164px); display: grid; grid-template-columns: repeat(5, minmax(230px, 1fr)); overflow-x: auto; background: var(--paper); }
+.has-preview .kanban { height: calc(100vh - 236px); }
 .has-drawer .kanban { padding-right: min(430px, 36vw); }
 .kanban-column { min-width: 230px; border-right: 1px solid var(--line-dark); }
 .kanban-column > header { height: 92px; padding: 17px 15px 14px; border-bottom: 1px solid var(--line-dark); background: rgb(255 255 255 / 54%); }
@@ -137,6 +139,22 @@ textarea { resize: vertical; padding: 12px; line-height: 1.5; }
 .agent-strip small { margin-top: 2px; color: #52617e; font-size: .55rem; }
 .agent-strip time { color: #52617e; font: 650 .52rem/1 "SFMono-Regular", monospace; }
 .empty-column { padding: 24px 8px; color: #8a949e; font: .62rem/1.4 "SFMono-Regular", monospace; text-align: center; }
+
+.preview-banner { min-height: 72px; display: flex; align-items: center; gap: 10px; padding: 12px 24px; border-bottom: 1px solid #b9c8ee; background: var(--cobalt-soft); }
+.preview-banner > div { min-width: 0; flex: 1; }
+.preview-banner strong, .preview-banner span { display: block; }
+.preview-banner strong { margin-bottom: 3px; font-size: .78rem; }
+.preview-banner span { color: #52617e; font-size: .68rem; line-height: 1.4; }
+.preview-banner .primary-button, .preview-banner .secondary-button { min-height: 38px; white-space: nowrap; font-size: .72rem; }
+
+.gate-repository { overflow: hidden; text-overflow: ellipsis; font: 650 .78rem/1 "SFMono-Regular", monospace; white-space: nowrap; }
+.repository-gate { position: relative; }
+.gate-board { filter: blur(1.5px); opacity: .58; user-select: none; }
+.gate-overlay { position: fixed; z-index: 20; inset: 64px 0 0; display: grid; place-items: center; padding: 24px; background: rgb(238 241 244 / 58%); backdrop-filter: blur(7px); }
+.gate-dialog { width: min(520px, 100%); padding: 28px; border: 1px solid var(--ink); border-radius: 7px; background: #fff; box-shadow: 0 24px 80px rgb(0 0 0 / 20%); }
+.gate-dialog h2 { margin: 0; font: 650 2rem/1.08 "SF Pro Rounded", "Arial Rounded MT Bold", system-ui, sans-serif; letter-spacing: -.045em; }
+.gate-dialog > p:not(.eyebrow) { margin: 18px 0 0; color: var(--muted); line-height: 1.55; }
+.gate-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 24px; }
 
 .task-drawer { position: fixed; z-index: 10; top: 64px; right: 0; bottom: 0; width: min(430px, 100vw); border-left: 1px solid var(--ink); background: #fff; box-shadow: -16px 0 32px rgb(23 27 32 / 9%); animation: drawer-in .2s ease-out; }
 .drawer-header { height: 46px; display: flex; align-items: center; justify-content: space-between; padding: 0 18px; border-bottom: 1px solid var(--line); }
@@ -214,6 +232,7 @@ textarea { resize: vertical; padding: 12px; line-height: 1.5; }
   .board-actions .live-state, .board-actions .tool-state { display: none; }
   .board-context { align-items: start; flex-direction: column; }
   .kanban { height: calc(100vh - 190px); grid-template-columns: repeat(5, 280px); }
+  .has-preview .kanban { height: calc(100vh - 278px); }
   .has-drawer .kanban { padding-right: 0; }
 }
 
@@ -228,6 +247,10 @@ textarea { resize: vertical; padding: 12px; line-height: 1.5; }
   .board-context { min-height: 104px; padding-inline: 16px; }
   .task-drawer { top: 0; width: 100%; border-left: 0; }
   .kanban { height: calc(100vh - 168px); }
+  .has-preview .kanban { height: calc(100vh - 280px); }
+  .preview-banner { align-items: stretch; flex-direction: column; padding: 14px 16px; }
+  .gate-overlay { inset: 0; }
+  .gate-dialog { padding: 24px 21px; }
   .modal { padding: 21px; }
 }
 

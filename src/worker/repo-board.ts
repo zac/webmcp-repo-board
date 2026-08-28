@@ -612,7 +612,7 @@ export class RepoBoard extends DurableObject<Env> {
       .exec<TaskRow>(`SELECT * FROM tasks ${includeArchived ? "" : "WHERE archived_at IS NULL"} ORDER BY created_at ASC LIMIT ?`, MAX_TASKS)
       .toArray()
       .map((task) => this.buildTaskView(task, viewer));
-    return { ...metadata, revision: this.currentRevision(), viewer, tasks };
+    return { ...metadata, materialized: true, revision: this.currentRevision(), viewer, tasks };
   }
 
   private buildTaskView(task: TaskRow, viewer: Viewer): TaskView {

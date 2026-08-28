@@ -2,6 +2,7 @@ import type { Viewer } from "../shared";
 
 const SESSION_COOKIE = "repo_board_session";
 const OAUTH_STATE_COOKIE = "repo_board_oauth_state";
+const OAUTH_RETURN_COOKIE = "repo_board_oauth_return";
 const SESSION_MS = 7 * 24 * 60 * 60 * 1_000;
 
 export interface AuthenticatedUser {
@@ -61,9 +62,13 @@ export function clearSessionCookie(requestUrl: URL): string {
   return cookie(SESSION_COOKIE, "", requestUrl, 0, true);
 }
 
-export function createOAuthState(requestUrl: URL): { state: string; cookie: string } {
+export function createOAuthState(requestUrl: URL, returnTo = "/"): { state: string; cookie: string; returnCookie: string } {
   const state = randomToken();
-  return { state, cookie: cookie(OAUTH_STATE_COOKIE, state, requestUrl, 600, true) };
+  return {
+    state,
+    cookie: cookie(OAUTH_STATE_COOKIE, state, requestUrl, 600, true),
+    returnCookie: cookie(OAUTH_RETURN_COOKIE, safeOAuthReturnPath(returnTo), requestUrl, 600, true),
+  };
 }
 
 export function verifyOAuthState(request: Request, state: string): boolean {
@@ -73,6 +78,26 @@ export function verifyOAuthState(request: Request, state: string): boolean {
 
 export function clearOAuthStateCookie(requestUrl: URL): string {
   return cookie(OAUTH_STATE_COOKIE, "", requestUrl, 0, true);
+}
+
+export function oauthReturnPath(request: Request): string {
+  const value = parseCookies(request.headers.get("cookie") ?? "").get(OAUTH_RETURN_COOKIE) ?? "/";
+  return safeOAuthReturnPath(value);
+}
+
+export function clearOAuthReturnCookie(requestUrl: URL): string {
+  return cookie(OAUTH_RETURN_COOKIE, "", requestUrl, 0, true);
+}
+
+export function safeOAuthReturnPath(value: string): string {
+  if (!/^\/boards\/[A-Za-z0-9_.%~-]{1,300}\/[A-Za-z0-9_.%~-]{1,300}\/?$/.test(value)) return "/";
+  try {
+    const decoded = value.split("/").slice(2).map(decodeURIComponent);
+    if (decoded.length !== 2 || decoded.some((part) => !/^[A-Za-z0-9_.-]{1,100}$/.test(part))) return "/";
+    return `/boards/${encodeURIComponent(decoded[0])}/${encodeURIComponent(decoded[1])}`;
+  } catch {
+    return "/";
+  }
 }
 
 export function viewerFor(user: AuthenticatedUser | null, roleName: string | null, canMutate: boolean): Viewer {

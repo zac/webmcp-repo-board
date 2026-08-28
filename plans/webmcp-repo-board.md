@@ -12,9 +12,12 @@ Archived is not a sixth column. Archiving sets a terminal flag on a Done task th
 
 Board-owned tasks move through typed WebMCP operations. A repository-scoped Durable Object serializes claims, transitions, and broadcasts, preventing two agents from owning the same assignment. Cloudflare recommends Durable Objects for exactly this kind of strongly consistent, real-time coordination. [Durable Object rules](https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/) and [WebSocket guidance](https://developers.cloudflare.com/durable-objects/best-practices/websockets/).
 
+Every GitHub repository has a stable entry route at `/boards/:owner/:repo`. A public repository with no stored board renders as an empty revision-0 preview without creating a Durable Object or D1 directory row. Signing in returns to the same route; if the GitHub App can verify that the user has a mutating collaborator role, that authenticated read atomically materializes the board. A private, nonexistent, or inaccessible route returns the same opaque response and the UI places a sign-in gate over an empty board shell, so signed-out requests cannot probe private repository existence.
+
 ## Product and workflow
 
 - The UI is kanban-style, but arbitrary dragging is disabled. State changes must satisfy workflow rules.
+- Humans can enter any `owner/repo` from the landing page or navigate directly to `/boards/:owner/:repo`; an explicit board-creation flow is not required.
 - Humans create and edit Todo tickets in the UI. Each ticket has a title, Markdown description, revision history, activity log, and optional linked PR.
 - “Plan with Codex” copies a prompt containing the board URL and ticket ID. “Implement with Codex” does the same for Ready or stale work.
 - Copying does not reserve the ticket. The first authorized agent to call `claim_task` receives the assignment. A simultaneous caller gets a structured conflict with the current owner and lease expiry.
@@ -31,7 +34,7 @@ Assignments use renewable 15-minute leases. Assignment tool calls renew the leas
 
 - One SQLite-backed `RepoBoard` Durable Object per `owner/repo`.
 - Its SQLite database owns tasks, plan revisions, assignments, progress reports, PR snapshots, processed actions, processed webhook deliveries, and the append-only board event log.
-- D1 stores only global data: GitHub identities, hashed web sessions, installations, and the `owner/repo → boardId` directory.
+- D1 stores only global data: GitHub identities, hashed web sessions, installations, and the `owner/repo → boardId` directory for materialized boards. Public previews are cached briefly at the edge and do not create database state.
 - Accepted commands update Durable Object SQLite atomically, increment the board revision, and then broadcast a revisioned update through hibernating WebSockets.
 - Reconnecting clients send their last revision and receive either missed events or a full snapshot.
 - One Durable Object alarm tracks the earliest due item across lease expiries and the next PR reconciliation poll. Reconciliation polling is the correctness path — it repairs any missed, delayed, or misordered webhook — so webhooks only reduce latency. A useful consequence: local development works end to end with no public webhook endpoint.
@@ -86,7 +89,8 @@ Use one read-only GitHub App for login, repository installation, API access, and
 - Verify `X-Hub-Signature-256` against the raw request body with constant-time comparison and deduplicate `X-GitHub-Delivery`. [GitHub webhook validation](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries).
 - Exchange GitHub’s OAuth callback for user identity, create a hashed local session, and discard the short-lived user token. Use installation credentials for later repository queries. [GitHub App user authentication](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app).
 - Resolve effective collaborator permission through GitHub's permission endpoint, which needs only Metadata read. Anonymous users and `read` users are read-only. `triage`, `write`, `maintain`, and `admin` users may mutate the board. Read the response's `role_name`, not the legacy `permission` field: `permission` collapses `triage` into `read` and `maintain` into `write`, which would wrongly deny every triage user. [Repository permission endpoint](https://docs.github.com/en/rest/collaborators/collaborators).
-- Existing public-repository boards are anonymously readable. Private boards fail closed unless the app is installed and the authenticated user has repository access.
+- Existing public-repository boards are anonymously readable. Public repositories without boards are also anonymously readable as empty virtual previews. Private, missing, and inaccessible routes share one opaque signed-out response; after sign-in, private repositories remain fail-closed unless the app is installed and GitHub verifies repository access.
+- OAuth carries only a validated same-origin board return path, so direct repository URLs survive the GitHub sign-in round trip without introducing an open redirect.
 - Cache authorization briefly, at most 60 seconds, and fail closed when GitHub cannot verify private access.
 - Store the App ID, private key, webhook secret, and OAuth client secret as Worker secrets via `wrangler secret put`. Production registers the deployed callback and webhook URLs; local development leans on reconciliation polling instead of forwarded webhooks.
 
@@ -98,7 +102,7 @@ A normalized PR snapshot contains PR number, URL, draft/open/closed/merged state
 
 - Reducer tests cover every legal transition and reject skipped columns, wrong assignment kinds, stale revisions, cross-repository PRs, closed PR linking, and invalid archival.
 - Concurrency tests issue simultaneous claims and prove exactly one succeeds. Cover duplicate actions, expiry, takeover, stale-agent mutations, release, and planner completion.
-- Authorization tests cover anonymous public reads, private-repository denial, each GitHub role including `triage` via `role_name`, session isolation, revoked access, CSRF state, and two tabs of one session holding different assignments without interference.
+- Authorization tests cover anonymous public reads, stateless public previews, indistinguishable private/missing routes, lazy materialization, each GitHub role including `triage` via `role_name`, session isolation, revoked access, CSRF state, safe OAuth return paths, and two tabs of one session holding different assignments without interference.
 - WebMCP tests assert the exact registry for every context, profile cleanup, duplicate-name prevention, bounded schemas/results, cancellation, confirmation, and UI/tool parity.
 - GitHub tests verify webhook signatures and deduplication, review/check normalization, delayed-event ordering, manual refresh, merge-to-Done, and closed-unmerged rollback.
 - Worker tests cover Durable Object eviction, persistence, WebSocket replay/resynchronization, alarm-driven lease expiry, and D1 board lookup.
@@ -106,4 +110,4 @@ A normalized PR snapshot contains PR number, URL, draft/open/closed/merged state
 
 Build in five focused slices: scaffold and state model; board UI plus real-time claims; dynamic WebMCP and copied prompts; GitHub App and PR synchronization; adversarial tests, polish, deployment, and the under-three-minute demo.
 
-Assumptions: one board per repository, one linked PR per task, board-owned tasks rather than GitHub Issues, no GitHub Projects synchronization, no agent launching, no native Codex telemetry, no anonymous writes, and no shared-package monorepo in v1.
+Assumptions: one materialized board per repository, one linked PR per task, board-owned tasks rather than GitHub Issues, no GitHub Projects synchronization, no agent launching, no native Codex telemetry, no anonymous writes, and no shared-package monorepo in v1.

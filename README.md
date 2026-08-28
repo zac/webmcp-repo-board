@@ -11,6 +11,7 @@ Archiving is a terminal flag on Done tasks, not another column. Archived history
 ## What is implemented
 
 - Atomic 15-minute assignment leases in one SQLite-backed Durable Object per `owner/repo`
+- Direct `/boards/:owner/:repo` routes with stateless blank previews for public repositories and lazy authenticated materialization
 - Revision-checked, idempotent task mutations and structured claim conflicts
 - Immutable ticket and delegated-plan revisions with an append-only activity log
 - Hibernating WebSockets with full snapshots, missed-event replay, and automatic reconnects
@@ -49,7 +50,7 @@ pnpm d1:migrate:local
 pnpm dev:worker
 ```
 
-Open `http://localhost:8787`. Local development offers a clearly labeled development session and can create public stand-in repository boards without GitHub credentials. Pull-request webhooks are optional locally; the scheduled reconciliation path is the correctness mechanism.
+Open `http://localhost:8787`. Enter any `owner/repo` or navigate directly to `/boards/owner/repo`. Local development offers a clearly labeled development session and materializes public stand-in boards without GitHub credentials. Pull-request webhooks are optional locally; the scheduled reconciliation path is the correctness mechanism.
 
 For the split Vite experience, run `pnpm dev:worker` and `pnpm dev` in separate terminals, then open the Vite URL.
 
@@ -86,7 +87,7 @@ Then install the app on the repositories that may have boards and deploy:
 pnpm deploy
 ```
 
-Private repositories fail closed. Existing public boards remain anonymously readable. Only effective `triage`, `write`, `maintain`, or `admin` collaborators can mutate a board.
+Any public GitHub repository route is anonymously readable. If no board exists, the Worker returns a cached, empty preview without writing D1 or creating a Durable Object. A signed-in `triage`, `write`, `maintain`, or `admin` collaborator automatically materializes it. Private, missing, and inaccessible repositories remain deliberately indistinguishable until GitHub verifies the signed-in user through the App installation.
 
 ## WebMCP workflow
 

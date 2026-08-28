@@ -122,6 +122,7 @@ export interface BoardView {
   fullName: string;
   htmlUrl: string;
   isPrivate: boolean;
+  materialized: boolean;
   revision: number;
   viewer: Viewer;
   tasks: TaskView[];

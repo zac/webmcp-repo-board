@@ -5,7 +5,7 @@ const API = "https://api.github.com";
 const API_VERSION = "2026-03-10";
 const MAX_GITHUB_RESPONSE = 2 * 1024 * 1024;
 
-interface GitHubRepository {
+export interface GitHubRepository {
   id: number;
   owner: string;
   repo: string;
