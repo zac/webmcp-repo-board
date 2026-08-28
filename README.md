@@ -81,7 +81,7 @@ pnpm wrangler secret put GITHUB_APP_CLIENT_SECRET
 pnpm wrangler secret put GITHUB_WEBHOOK_SECRET
 ```
 
-Then install the app on the repositories that may have boards and deploy:
+Then install the app on the repositories that may have boards. A manual deploy is useful while bootstrapping:
 
 ```sh
 pnpm deploy
@@ -105,6 +105,22 @@ pnpm deploy:dry
 ```
 
 `pnpm check` runs ESLint, both TypeScript projects, Node tests, Miniflare Worker/Durable Object tests, and the production build. The Worker suite covers D1 routing, role authorization, session isolation, concurrent claims, idempotency, lease expiry and takeover, SQLite persistence across eviction, WebSocket replay, webhook verification, PR normalization, and the full workflow.
+
+## Cloudflare Workers Builds
+
+Production builds and deployments run on Cloudflare Workers Builds. The repository does not use GitHub Actions.
+
+Connect the existing `webmcp-repo-board` Worker to `zac/webmcp-repo-board` under **Settings > Builds** in the Cloudflare dashboard, then use:
+
+- Production branch: `main`
+- Root directory: `/`
+- Build command: `pnpm check`
+- Deploy command: `pnpm wrangler deploy`
+- Non-production deploy command: `pnpm wrangler versions upload`
+- Build variable: `PNPM_VERSION=11.13.1`
+- Build cache: enabled
+
+Enable non-production branch builds to run the same checks for pull requests. This Worker uses a Durable Object, so Cloudflare uploads branch versions but does not create preview URLs for them. Keep GitHub App credentials in the Worker's runtime secrets, not in Workers Builds variables.
 
 The repeatable demo and browser acceptance script is in [evals/browser-acceptance.md](evals/browser-acceptance.md).
 

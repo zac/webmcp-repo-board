@@ -28,7 +28,7 @@
     {
       "binding": "DIRECTORY",
       "database_name": "repo-board-directory",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "04a4bce9-8e44-42aa-b78d-ab7d8b81ed10",
       "migrations_dir": "migrations"
     }
   ],
@@ -37,8 +37,16 @@
   },
   "vars": {
     "ENVIRONMENT": "production",
-    "GITHUB_APP_CLIENT_ID": "replace-with-client-id",
-    "GITHUB_APP_SLUG": "replace-with-app-slug"
+    "GITHUB_APP_CLIENT_ID": "Iv23lieDHBQ8Wg8zQTqt",
+    "GITHUB_APP_SLUG": "webmcp-repo-board"
+  },
+  "secrets": {
+    "required": [
+      "GITHUB_APP_ID",
+      "GITHUB_APP_PRIVATE_KEY",
+      "GITHUB_APP_CLIENT_SECRET",
+      "GITHUB_WEBHOOK_SECRET"
+    ]
   },
   "observability": {
     "enabled": true,
