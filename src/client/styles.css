@@ -58,7 +58,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .index-page { min-height: 100vh; padding: 0 clamp(24px, 6vw, 86px) 70px; background-image: linear-gradient(90deg, transparent calc(100% - 1px), rgb(174 183 193 / 20%) 1px); background-size: 80px 100%; }
 .index-header { height: 80px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line-dark); }
 .session-control { display: flex; align-items: center; gap: 16px; }
-.user-chip, .private-chip { display: inline-flex; align-items: center; min-height: 26px; padding: 0 9px; border: 1px solid var(--line-dark); border-radius: 999px; background: rgb(255 255 255 / 55%); font: 650 .72rem/1 "SFMono-Regular", monospace; }
+.user-chip { display: inline-flex; align-items: center; min-height: 26px; padding: 0 9px; border: 1px solid var(--line-dark); border-radius: 999px; background: rgb(255 255 255 / 55%); font: 650 .72rem/1 "SFMono-Regular", monospace; }
 .index-intro { max-width: 840px; padding: clamp(70px, 11vw, 140px) 0 70px; }
 .index-intro h1 { max-width: 780px; margin: 0; font: 650 clamp(3rem, 7vw, 6.6rem)/.92 "SF Pro Rounded", "Arial Rounded MT Bold", system-ui, sans-serif; letter-spacing: -.075em; }
 .index-intro > p:last-child { max-width: 560px; margin: 30px 0 0; color: var(--muted); font-size: 1.12rem; line-height: 1.55; }
@@ -94,9 +94,6 @@ textarea { resize: vertical; padding: 12px; line-height: 1.5; }
 .back-button { width: 38px; height: 38px; border: 1px solid var(--line); border-radius: 50%; background: #fff; font-size: 1.15rem; }
 .back-button:hover { border-color: var(--ink); }
 .board-identity, .board-actions { display: flex; align-items: center; gap: 12px; min-width: 0; }
-.board-identity > a { overflow: hidden; text-overflow: ellipsis; font: 650 .78rem/1 "SFMono-Regular", monospace; white-space: nowrap; text-decoration: none; }
-.identity-divider { width: 1px; height: 22px; background: var(--line-dark); }
-.private-chip { min-height: 22px; font-size: .62rem; }
 .live-state, .tool-state { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font: 700 .65rem/1 "SFMono-Regular", monospace; text-transform: uppercase; }
 .live-state i { width: 7px; height: 7px; border-radius: 50%; background: var(--line-dark); }
 .live-state.live i { background: #35a36f; box-shadow: 0 0 0 4px rgb(53 163 111 / 12%); }
@@ -104,6 +101,12 @@ textarea { resize: vertical; padding: 12px; line-height: 1.5; }
 .live-state.preview i { background: var(--cobalt); }
 .board-context { min-height: 100px; display: flex; align-items: end; justify-content: space-between; gap: 30px; padding: 22px 24px 18px; border-bottom: 1px solid var(--line-dark); }
 .board-context h1 { margin: 0; font: 650 1.8rem/1.1 "SF Pro Rounded", "Arial Rounded MT Bold", sans-serif; letter-spacing: -.045em; }
+.repository-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.repository-title a { display: inline-flex; align-items: baseline; gap: 8px; min-width: 0; text-decoration: none; }
+.repository-title a:hover { text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 4px; }
+.repository-link-arrow { color: var(--muted); font: 700 .78rem/1 "SFMono-Regular", monospace; letter-spacing: 0; }
+.repository-lock { width: 20px; height: 20px; display: inline-flex; flex: none; align-items: center; justify-content: center; color: var(--muted); }
+.repository-lock svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
 .board-context > p { margin: 0 0 3px; color: var(--muted); font: .68rem/1.4 "SFMono-Regular", monospace; }
 .kanban { height: calc(100vh - 164px); display: grid; grid-template-columns: repeat(5, minmax(230px, 1fr)); overflow-x: auto; background: var(--paper); }
 .has-preview .kanban { height: calc(100vh - 236px); }
@@ -243,7 +246,7 @@ textarea { resize: vertical; padding: 12px; line-height: 1.5; }
   .index-intro h1 { font-size: 3.25rem; }
   .repository-list { padding-right: 0; }
   .connect-panel { padding: 28px 22px; }
-  .board-identity .wordmark, .identity-divider, .private-chip { display: none; }
+  .board-identity .wordmark { display: none; }
   .board-context { min-height: 104px; padding-inline: 16px; }
   .task-drawer { top: 0; width: 100%; border-left: 0; }
   .kanban { height: calc(100vh - 168px); }

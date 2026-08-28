@@ -553,9 +553,6 @@ function BoardPage(props: {
         <button className="back-button" onClick={props.onBack} aria-label="Back to repositories">←</button>
         <div className="board-identity">
           <Wordmark compact />
-          <span className="identity-divider" />
-          <a href={props.board.htmlUrl} target="_blank" rel="noreferrer">{props.board.fullName} ↗</a>
-          {props.board.isPrivate && <span className="private-chip">private</span>}
         </div>
         <div className="board-actions">
           <span className={`live-state ${props.realtime}`}><i />{props.realtime}</span>
@@ -564,7 +561,22 @@ function BoardPage(props: {
         </div>
       </header>
       <section className="board-context">
-        <div><p className="eyebrow">Live repository queue</p><h1>{props.board.fullName}</h1></div>
+        <div>
+          <p className="eyebrow">Live repository queue</p>
+          <h1 className="repository-title">
+            <a href={props.board.htmlUrl} target="_blank" rel="noreferrer" title={`Open ${props.board.fullName} on GitHub`}>
+              {props.board.fullName}<span className="repository-link-arrow" aria-hidden="true">↗</span>
+            </a>
+            {props.board.isPrivate && (
+              <span className="repository-lock" role="img" aria-label="Private repository" title="Private repository">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="5" y="10" width="14" height="10" rx="2" />
+                  <path d="M8 10V7a4 4 0 0 1 8 0v3" />
+                </svg>
+              </span>
+            )}
+          </h1>
+        </div>
         <p>Revision <strong>{props.board.revision}</strong> · {props.board.viewer.login ? `signed in as @${props.board.viewer.login}` : "public read-only view"}</p>
       </section>
       {!props.board.materialized && (
