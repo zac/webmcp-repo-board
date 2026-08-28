@@ -33,6 +33,7 @@ import {
   exchangeOAuthCode,
   fetchGitHubIdentity,
   fetchPullRequestSnapshot,
+  fetchPublicRepository,
   fetchRepository,
   installationToken,
   parsePullRequestUrl,
@@ -304,15 +305,11 @@ async function fetchPublicRepositoryCached(env: Env, ctx: ExecutionContext, owne
   const cacheKey = new Request(`https://repo-board-cache.invalid/repositories/${encodeURIComponent(owner.toLowerCase())}/${encodeURIComponent(repo.toLowerCase())}`);
   const cached = await caches.default.match(cacheKey);
   if (cached) return await cached.json<GitHubRepository>();
-  try {
-    const repository = await fetchRepository(owner, repo, null);
-    const response = Response.json(repository, { headers: { "cache-control": "public, max-age=300" } });
-    ctx.waitUntil(caches.default.put(cacheKey, response));
-    return repository;
-  } catch (error) {
-    if (error instanceof GitHubError && error.status === 404) throw repositoryUnavailable();
-    throw error;
-  }
+  const repository = await fetchPublicRepository(owner, repo);
+  if (!repository) throw repositoryUnavailable();
+  const response = Response.json(repository, { headers: { "cache-control": "public, max-age=300" } });
+  ctx.waitUntil(caches.default.put(cacheKey, response));
+  return repository;
 }
 
 function syntheticRepository(owner: string, repo: string, isPrivate: boolean): GitHubRepository {

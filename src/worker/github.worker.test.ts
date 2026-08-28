@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   canMutateForRole,
   canReadForRole,
+  fetchPublicRepository,
   fetchPullRequestSnapshot,
   parsePullRequestUrl,
   verifyWebhookSignature,
@@ -24,6 +25,30 @@ describe("GitHub boundaries", () => {
     expect(parsePullRequestUrl("https://github.com/Acme/Widgets/pull/42", "acme", "widgets")).toBe(42);
     expect(() => parsePullRequestUrl("https://github.com/acme/other/pull/42", "acme", "widgets")).toThrowError(/must belong/);
     expect(() => parsePullRequestUrl("https://evil.example/acme/widgets/pull/42", "acme", "widgets")).toThrowError(/must belong/);
+  });
+
+  it("fails closed when an anonymous repository lookup is rate limited", async () => {
+    const upstreamMessage = "API rate limit exceeded for 104.22.20.4";
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ message: upstreamMessage }, { status: 403 })));
+
+    await expect(fetchPublicRepository("acme", "private-or-missing")).resolves.toBeNull();
+  });
+
+  it("returns public repository metadata when the anonymous lookup succeeds", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({
+      id: 42,
+      name: "widgets",
+      full_name: "acme/widgets",
+      html_url: "https://github.com/acme/widgets",
+      private: false,
+      owner: { login: "acme" },
+    })));
+
+    await expect(fetchPublicRepository("acme", "widgets")).resolves.toMatchObject({
+      id: 42,
+      fullName: "acme/widgets",
+      isPrivate: false,
+    });
   });
 
   it("verifies webhook HMACs and rejects malformed signatures", async () => {

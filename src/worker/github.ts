@@ -57,6 +57,15 @@ export async function fetchRepository(owner: string, repo: string, token: string
   };
 }
 
+export async function fetchPublicRepository(owner: string, repo: string): Promise<GitHubRepository | null> {
+  try {
+    return await fetchRepository(owner, repo, null);
+  } catch (error) {
+    if (error instanceof GitHubError || error instanceof TypeError) return null;
+    throw error;
+  }
+}
+
 export async function collaboratorRole(owner: string, repo: string, login: string, token: string): Promise<string | null> {
   try {
     const body = recordValue(await githubJson(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/collaborators/${encodeURIComponent(login)}/permission`, token));
