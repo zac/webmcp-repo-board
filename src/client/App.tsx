@@ -472,11 +472,13 @@ function RepositoryGate(props: {
   onDevelopmentLogin: () => void;
 }): ReactNode {
   const fullName = `${props.route.owner}/${props.route.repo}`;
+  const copy = repositoryGateCopy(Boolean(props.user));
   return (
     <main className="board-page repository-gate">
       <header className="board-header">
         <button className="back-button" onClick={props.onBack} aria-label="Back to repositories">←</button>
         <div className="board-identity"><Wordmark compact /><span className="identity-divider" /><span className="gate-repository">{fullName}</span></div>
+        {props.user && <span className="user-chip">Signed in as @{props.user.login}</span>}
       </header>
       <section className="board-context"><div><p className="eyebrow">Repository board</p><h1>{fullName}</h1></div></section>
       <section className="kanban gate-board" aria-hidden="true">
@@ -484,12 +486,12 @@ function RepositoryGate(props: {
       </section>
       <div className="gate-overlay">
         <section className="gate-dialog" role="dialog" aria-modal="true" aria-labelledby="repository-gate-title">
-          <p className="eyebrow">Private or unavailable</p>
-          <h2 id="repository-gate-title">We can’t tell whether this repository exists.</h2>
-          <p>It may be private, missing, or outside this GitHub App installation. Sign in to let GitHub verify your access without revealing private repository names.</p>
+          <p className="eyebrow">{copy.eyebrow}</p>
+          <h2 id="repository-gate-title">{copy.title}</h2>
+          <p>{copy.body}</p>
           <div className="gate-actions">
             {!props.user && <a className="primary-button link-button" href={loginUrl(props.config)}>Sign in with GitHub</a>}
-            {props.user && <a className="primary-button link-button" href={props.config?.githubInstallUrl} target="_blank" rel="noreferrer">Configure GitHub App ↗</a>}
+            {props.user && <a className="primary-button link-button" href={props.config?.githubInstallUrl} target="_blank" rel="noreferrer">Review GitHub App access ↗</a>}
             {props.user && <button className="secondary-button" onClick={() => window.location.reload()}>Check again</button>}
             {!props.user && props.config?.localDevelopment && <button className="secondary-button" onClick={props.onDevelopmentLogin}>Use local session</button>}
           </div>
@@ -497,6 +499,20 @@ function RepositoryGate(props: {
       </div>
     </main>
   );
+}
+
+export function repositoryGateCopy(authenticated: boolean): { eyebrow: string; title: string; body: string } {
+  return authenticated
+    ? {
+        eyebrow: "Repository unavailable",
+        title: "Repo Board couldn’t verify access.",
+        body: "The repository may not exist, your account may not have access, or the GitHub App may need permission for it.",
+      }
+    : {
+        eyebrow: "Sign in required",
+        title: "This repository may be private or unavailable.",
+        body: "Sign in with GitHub so Repo Board can check whether you have access.",
+      };
 }
 
 function BoardPage(props: {
