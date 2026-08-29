@@ -264,6 +264,12 @@ describe("dynamic WebMCP profiles", () => {
     expect(String(result).length).toBeLessThanOrEqual(40_000);
   });
 
+  it("marks the claim result containing task text as untrusted", async () => {
+    const registry = new Registry();
+    await registerBoardTools(registry, handlers(board(task("ready"))), new AbortController().signal);
+    expect(registry.tools.get("claim_task")?.annotations?.untrustedContentHint).toBe(true);
+  });
+
   it("loads archived task history without adding it to the live board", async () => {
     const registry = new Registry();
     const archivedTask = { ...task("done"), archivedAt: 100 };

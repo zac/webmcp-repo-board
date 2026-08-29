@@ -2,6 +2,7 @@ import { SELF, applyD1Migrations, env, reset, type D1Migration } from "cloudflar
 import { beforeEach, describe, expect, it } from "vitest";
 import type { BoardView } from "../shared";
 import { createOAuthState, createSession, oauthReturnPath, safeOAuthReturnPath, sessionCookie, userFromRequest, verifyOAuthState } from "./auth";
+import { webhookPullRequestNumbers } from "./index";
 
 const testEnv = env as Env & { TEST_MIGRATIONS: D1Migration[] };
 
@@ -13,6 +14,7 @@ beforeEach(async () => {
 async function seedBoard(repo: string, isPrivate: boolean): Promise<void> {
   const id = `acme/${repo}`;
   const now = Date.now();
+  const repositoryId = Math.floor(Math.random() * -1_000_000) - 1;
   await env.DIRECTORY.prepare(
     `INSERT OR REPLACE INTO installations (installation_id, account_login, account_type, suspended_at, updated_at)
      VALUES (0, 'acme', 'organization', NULL, ?)`,
@@ -20,8 +22,8 @@ async function seedBoard(repo: string, isPrivate: boolean): Promise<void> {
   await env.DIRECTORY.prepare(
     `INSERT INTO boards (id, owner, repo, full_name, repository_id, installation_id, is_private, html_url, created_by, created_at, updated_at)
      VALUES (?, 'acme', ?, ?, ?, 0, ?, ?, 'seed', ?, ?)`,
-  ).bind(id, repo, `acme/${repo}`, Math.floor(Math.random() * -1_000_000) - 1, isPrivate ? 1 : 0, `https://github.com/acme/${repo}`, now, now).run();
-  await env.REPO_BOARD.getByName(id).initialize({ id, owner: "acme", repo, fullName: `acme/${repo}`, htmlUrl: `https://github.com/acme/${repo}`, isPrivate });
+  ).bind(id, repo, `acme/${repo}`, repositoryId, isPrivate ? 1 : 0, `https://github.com/acme/${repo}`, now, now).run();
+  await env.REPO_BOARD.getByName(id).initialize({ id, owner: "acme", repo, fullName: `acme/${repo}`, repositoryId, installationId: 0, htmlUrl: `https://github.com/acme/${repo}`, isPrivate });
 }
 
 function authenticated(role: string, userId = "user-zac", login = "zac", init: RequestInit = {}): RequestInit {
@@ -71,6 +73,13 @@ describe("Worker authorization and directory routing", () => {
     expect((await SELF.fetch("https://example.com/api/boards/acme/private")).status).toBe(404);
   });
 
+  it("does not fan anonymous directory requests out into per-board authorization", async () => {
+    await seedBoard("listed-public", false);
+    const response = await SELF.fetch("https://example.com/api/boards");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ boards: [] });
+  });
+
   it.each([
     ["read", false],
     ["triage", true],
@@ -96,6 +105,20 @@ describe("Worker authorization and directory routing", () => {
     await seedBoard("revoked", true);
     const response = await SELF.fetch("https://example.com/api/boards/acme/revoked", authenticated("none"));
     expect(response.status).toBe(404);
+  });
+
+  it("authorizes an existing private board before returning create metadata", async () => {
+    await seedBoard("existing-private", true);
+    const request = (role: string) => SELF.fetch("https://example.com/api/boards", authenticated(role, "user-zac", "zac", {
+      method: "POST",
+      headers: { origin: "https://example.com", "content-type": "application/json" },
+      body: JSON.stringify({ owner: "acme", repo: "existing-private" }),
+    }));
+    const hidden = await request("none");
+    const missing = await SELF.fetch("https://example.com/api/boards/acme/missing");
+    expect(hidden.status).toBe(404);
+    expect(await hidden.json()).toEqual(await missing.json());
+    expect((await request("triage")).status).toBe(200);
   });
 
   it("keeps two assignments from the same session user independent across tabs", async () => {
@@ -146,5 +169,18 @@ describe("sessions and OAuth state", () => {
     expect(oauthReturnPath(request)).toBe("/boards/zac/repo-board");
     expect(safeOAuthReturnPath("https://attacker.example/boards/zac/repo-board")).toBe("/");
     expect(safeOAuthReturnPath("/boards/zac/repo-board?next=https://attacker.example")).toBe("/");
+  });
+});
+
+describe("GitHub webhook routing", () => {
+  it("accepts only bounded pull-request-affecting event actions", () => {
+    expect(webhookPullRequestNumbers("pull_request", { action: "synchronize", pull_request: { number: 7 } })).toEqual([7]);
+    expect(webhookPullRequestNumbers("pull_request", { action: "labeled", pull_request: { number: 7 } })).toEqual([]);
+    expect(webhookPullRequestNumbers("issue_comment", { action: "created", issue: { number: 8 } })).toEqual([]);
+    expect(webhookPullRequestNumbers("issue_comment", { action: "created", issue: { number: 8, pull_request: {} } })).toEqual([8]);
+    expect(webhookPullRequestNumbers("check_run", {
+      action: "completed",
+      check_run: { pull_requests: Array.from({ length: 30 }, (_, index) => ({ number: index + 1 })) },
+    })).toHaveLength(20);
   });
 });

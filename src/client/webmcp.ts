@@ -150,7 +150,7 @@ export async function registerBoardTools(context: WebMcpContext, handlers: Board
         required: ["kind", "agentLabel"],
         anyOf: [{ required: ["taskRef"] }, { required: ["taskId"] }],
       },
-      annotations: { readOnlyHint: false, destructiveHint: false, untrustedContentHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: false, untrustedContentHint: true },
       execute: async (input, execution) => {
         const requested = typeof input.taskRef === "string" ? input.taskRef : typeof input.taskId === "string" ? input.taskId : "";
         const requestedTask = findTask(handlers.getBoard().tasks, requested);

@@ -43,6 +43,8 @@ async function freshBoard(label: string): Promise<DurableObjectStub<RepoBoard>> 
     owner: "acme",
     repo: "widgets",
     fullName: "acme/widgets",
+    repositoryId: 1,
+    installationId: 1,
     htmlUrl: "https://github.com/acme/widgets",
     isPrivate: false,
   });
@@ -143,6 +145,48 @@ describe("RepoBoard Durable Object", () => {
     expect(history.tasks[0]).toMatchObject({ resolution: "completed", resolutionReason: null });
     expect(history.tasks[0].reference).toBe(taskReference);
     expect(history.tasks[0].archivedAt).not.toBeNull();
+  });
+
+  it("applies the newest reserved pull-request refresh even when requests finish out of order", async () => {
+    const stub = await freshBoard("pr-generation");
+    let view = unwrap(await command(stub, zac, 0, { type: "create_task", title: "Ordered PR", description: "Keep terminal state" }));
+    const taskId = view.tasks[0].id;
+    view = unwrap(await command(stub, zac, 1, { type: "claim_task", taskId, kind: "planning", agentLabel: "Planner" }));
+    unwrap(await command(stub, zac, 2, { type: "set_plan", assignmentId: view.tasks[0].assignment!.id, markdown: "Plan" }));
+    view = unwrap(await command(stub, zac, 3, { type: "claim_task", taskId, kind: "implementation", agentLabel: "Builder" }));
+    view = unwrap(await command(stub, zac, 4, { type: "start_work", assignmentId: view.tasks[0].assignment!.id }));
+    unwrap(await command(stub, zac, 5, { type: "link_pull_request_snapshot", assignmentId: view.tasks[0].assignment!.id, snapshot: pullRequest() }));
+
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(`WITH RECURSIVE sequence(value) AS (
+        SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 5005
+      ) INSERT INTO events (revision, event_type, task_id, actor_login, occurred_at, data_json)
+      SELECT 0, 'historical', NULL, 'test', value, '{}' FROM sequence`);
+    });
+    const refreshNow = Date.now();
+    const first = unwrap(await stub.reservePullRequestRefresh(taskId));
+    await stub.recordPullRequestRefreshFailure(taskId, first.generation, refreshNow);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const retry = state.storage.sql.exec<{ failure_count: number; next_reconcile_at: number }>(
+        "SELECT failure_count, next_reconcile_at FROM pr_snapshots WHERE task_id = ?",
+        taskId,
+      ).one();
+      expect(retry).toEqual({ failure_count: 1, next_reconcile_at: refreshNow + 5 * 60 * 1_000 });
+    });
+    const second = unwrap(await stub.reservePullRequestRefresh(taskId));
+    unwrap(await stub.applyPullRequest(pullRequest({ state: "closed", merged: true }), "newer", Date.now(), second.generation));
+    expect(unwrap(await stub.applyPullRequest(pullRequest({ state: "open", merged: false }), "older", Date.now(), first.generation))).toBeNull();
+    expect(unwrap(await stub.getView(viewer(zac), false)).tasks[0]).toMatchObject({ column: "done", resolution: "completed" });
+    await runInDurableObject(stub, async (instance, state) => {
+      expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM events").one().count).toBe(5_000);
+      state.storage.sql.exec(`WITH RECURSIVE sequence(value) AS (
+        SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 10
+      ) INSERT INTO events (revision, event_type, task_id, actor_login, occurred_at, data_json)
+      SELECT 0, 'historical', NULL, 'test', value, '{}' FROM sequence`);
+      state.storage.sql.exec("UPDATE pr_snapshots SET next_reconcile_at = 0 WHERE task_id = ?", taskId);
+      await instance.alarm();
+      expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM events").one().count).toBe(5_000);
+    });
   });
 
   it("cancels active work atomically and retains its reason in archived history", async () => {
@@ -252,6 +296,10 @@ describe("RepoBoard Durable Object", () => {
     expect(replay).toEqual(first);
     const view = unwrap(first);
     expect(view.tasks).toHaveLength(1);
+    await runInDurableObject(stub, async (_instance, state) => {
+      const receipt = state.storage.sql.exec<{ result_json: string }>("SELECT result_json FROM processed_actions WHERE action_id = ?", actionId).one();
+      expect(receipt.result_json).toBe('{"revision":1}');
+    });
 
     const stale = await command(stub, zac, 0, { type: "edit_task", taskId: view.tasks[0].id, title: "Stale", description: "No" });
     expect(stale.ok).toBe(false);
@@ -267,6 +315,14 @@ describe("RepoBoard Durable Object", () => {
     expect(expiredView.revision).toBe(3);
     const takeover = unwrap(await command(stub, ada, 3, { type: "claim_task", taskId: view.tasks[0].id, kind: "planning", agentLabel: "Takeover" }));
     expect(takeover.tasks[0].assignment).toMatchObject({ userLogin: "ada", agentLabel: "Takeover" });
+  });
+
+  it("bounds retained webhook receipts", async () => {
+    const stub = await freshBoard("webhook-retention");
+    for (let index = 0; index < 2_050; index += 1) await stub.beginWebhook(`delivery-${index}`, index);
+    await runInDurableObject(stub, async (_instance, state) => {
+      expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM processed_webhooks").one().count).toBe(2_000);
+    });
   });
 
   it("releases ownership immediately and rejects the former assignment", async () => {
@@ -306,12 +362,9 @@ describe("RepoBoard Durable Object", () => {
     unwrap(await command(stub, zac, 1, { type: "create_task", title: "Second", description: "Live update" }));
     const update = await updatePromise;
     expect(update).toMatchObject({ type: "updated", revision: 2 });
-    const replayPromise = nextSocketMessage(socket);
+    const closePromise = nextSocketClose(socket);
     socket.send(JSON.stringify({ type: "resync", revision: 0 }));
-    const replay = await replayPromise;
-    expect(replay).toMatchObject({ type: "snapshot", revision: 2 });
-    expect(replay.events).toHaveLength(2);
-    socket.close(1000, "done");
+    expect(await closePromise).toMatchObject({ code: 1008, reason: "Client messages are not supported" });
   });
 
   it("recovers its SQLite state after eviction", async () => {
@@ -331,6 +384,16 @@ function nextSocketMessage(socket: WebSocket): Promise<{ type: string; revision:
     socket.addEventListener("message", (event) => {
       clearTimeout(timeout);
       resolve(JSON.parse(String(event.data)) as { type: string; revision: number; events: unknown[] });
+    }, { once: true });
+  });
+}
+
+function nextSocketClose(socket: WebSocket): Promise<{ code: number; reason: string }> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timed out waiting for WebSocket close")), 2_000);
+    socket.addEventListener("close", (event) => {
+      clearTimeout(timeout);
+      resolve({ code: event.code, reason: event.reason });
     }, { once: true });
   });
 }

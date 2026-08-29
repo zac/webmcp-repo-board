@@ -126,7 +126,15 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       return Response.json(await resolveDirectBoard(request, env, ctx, url, owner, repo));
     }
     if (!board) throw repositoryUnavailable();
-    const authorization = await authorizeBoard(request, env, board);
+    let authorization: { user: AuthenticatedUser | null; viewer: Viewer };
+    try {
+      authorization = await authorizeBoard(request, env, board);
+    } catch (error) {
+      if (operation === "view" && request.method === "GET" && error instanceof RequestError && error.status === 404) {
+        return Response.json(await resolveExistingPublicPreview(request, env, board));
+      }
+      throw error;
+    }
 
     if (operation === "view" && request.method === "GET") {
       const includeArchived = url.searchParams.get("archived") === "1";
@@ -181,7 +189,9 @@ async function finishOAuth(request: Request, url: URL, env: Env): Promise<Respon
 }
 
 async function listBoards(request: Request, env: Env): Promise<Response> {
-  const rows = await env.DIRECTORY.prepare("SELECT id, owner, repo, full_name, repository_id, installation_id, is_private, html_url FROM boards ORDER BY full_name LIMIT 100")
+  const user = await userFromRequest(request, env);
+  if (!user) return Response.json({ boards: [] });
+  const rows = await env.DIRECTORY.prepare("SELECT id, owner, repo, full_name, repository_id, installation_id, is_private, html_url FROM boards ORDER BY full_name LIMIT 20")
     .all<BoardRecord>();
   const visible: BoardSummary[] = [];
   for (const board of rows.results) {
@@ -203,7 +213,10 @@ async function createBoard(request: Request, env: Env, url: URL): Promise<Respon
   const repo = repoPart(body.repo, "repo");
   const fullName = `${owner}/${repo}`;
   const existing = await boardRecord(env, owner, repo);
-  if (existing) return Response.json(boardSummary(existing));
+  if (existing) {
+    const authorization = await authorizeBoard(request, env, existing);
+    return Response.json({ ...boardSummary(existing), roleName: authorization.viewer.roleName });
+  }
 
   let installationId: number;
   let repository: { id: number; owner: string; repo: string; fullName: string; htmlUrl: string; isPrivate: boolean };
@@ -297,7 +310,8 @@ async function materializeBoard(env: Env, repository: GitHubRepository, installa
   ]);
   const board = await boardRecord(env, repository.owner, repository.repo);
   if (!board) throw new RequestError("board_initialization_failed", "Repository board could not be initialized", 500);
-  await boardStub(env, board.id).initialize({ id: board.id, owner: board.owner, repo: board.repo, fullName: board.full_name, htmlUrl: board.html_url, isPrivate: Boolean(board.is_private) });
+  if (board.repository_id !== repository.id || board.installation_id !== installationId) throw repositoryUnavailable();
+  await initializeBoard(env, board);
   return board;
 }
 
@@ -356,10 +370,15 @@ async function executeCommand(request: Request, env: Env, board: BoardRecord, us
 
 async function refreshTask(env: Env, board: BoardRecord, viewer: Viewer, taskId: string): Promise<Response> {
   const stub = boardStub(env, board.id);
-  const linked = unwrap(await stub.getLinkedPullRequest(taskId));
+  const linked = unwrap(await stub.reservePullRequestRefresh(taskId));
   const token = await installationToken(env, board.installation_id);
-  const snapshot = await fetchPullRequestSnapshot(board.owner, board.repo, linked.number, token);
-  unwrap(await stub.applyPullRequest(snapshot, "manual", Date.now()));
+  try {
+    const snapshot = await fetchPullRequestSnapshot(board.owner, board.repo, linked.number, token);
+    unwrap(await stub.applyPullRequest(snapshot, "manual", Date.now(), linked.generation));
+  } catch (error) {
+    await stub.recordPullRequestRefreshFailure(linked.taskId, linked.generation, Date.now());
+    throw error;
+  }
   return Response.json(unwrap(await stub.getView(viewer, false)));
 }
 
@@ -372,7 +391,7 @@ async function connectSocket(request: Request, env: Env, board: BoardRecord, vie
     headers: {
       upgrade: "websocket",
       "x-board-viewer": JSON.stringify(viewer),
-      "x-board-authorized-until": String(Date.now() + 60_000),
+      "x-board-authorized-until": String(Date.now() + 30_000),
     },
   });
   return boardStub(env, board.id).fetch(internal);
@@ -380,41 +399,75 @@ async function connectSocket(request: Request, env: Env, board: BoardRecord, vie
 
 async function authorizeBoard(request: Request, env: Env, board: BoardRecord): Promise<{ user: AuthenticatedUser | null; viewer: Viewer }> {
   const user = await userFromRequest(request, env);
-  if (!user) {
-    if (board.is_private) throw new RequestError("board_not_found", "Repository board was not found", 404);
-    return { user: null, viewer: viewerFor(null, null, false) };
-  }
-
   if (String(env.ENVIRONMENT) === "test") {
+    if (!user) {
+      if (board.is_private) throw repositoryUnavailable();
+      return { user: null, viewer: viewerFor(null, null, false) };
+    }
     const roleName = request.headers.get("x-test-role") ?? "read";
-    if (board.is_private && !canReadForRole(roleName)) throw new RequestError("board_not_found", "Repository board was not found", 404);
+    if (board.is_private && !canReadForRole(roleName)) throw repositoryUnavailable();
     return { user, viewer: viewerFor(user, roleName, canMutateForRole(roleName)) };
   }
-  if (board.installation_id === 0) return { user, viewer: viewerFor(user, "admin", true) };
+  if (board.installation_id === 0) return user
+    ? { user, viewer: viewerFor(user, "admin", true) }
+    : { user: null, viewer: viewerFor(null, null, false) };
 
-  const now = Date.now();
-  const cached = await env.DIRECTORY.prepare("SELECT role_name, checked_at FROM permission_cache WHERE user_id = ? AND board_id = ?")
-    .bind(user.userId, board.id).first<{ role_name: string; checked_at: number }>();
-  let roleName: string | null;
-  if (cached && cached.checked_at > now - 60_000) {
-    roleName = cached.role_name === "none" ? null : cached.role_name;
-  } else {
-    try {
-      const token = await installationToken(env, board.installation_id);
-      if (!token) throw new GitHubError("installation_missing", "GitHub installation is unavailable", 404);
-      roleName = await collaboratorRole(board.owner, board.repo, user.login, token);
-      await env.DIRECTORY.prepare(
-        `INSERT INTO permission_cache (user_id, board_id, role_name, checked_at) VALUES (?, ?, ?, ?)
-         ON CONFLICT(user_id, board_id) DO UPDATE SET role_name = excluded.role_name, checked_at = excluded.checked_at`,
-      ).bind(user.userId, board.id, roleName ?? "none", now).run();
-    } catch (error) {
-      if (board.is_private) throw new RequestError("board_not_found", "Repository board was not found", 404);
-      console.error(JSON.stringify({ event: "permission_check_failed", board: board.full_name, error: error instanceof Error ? error.message : "unknown" }));
-      roleName = null;
-    }
+  const { token } = await resolveBoundRepository(env, board);
+  if (!user) {
+    if (board.is_private) throw repositoryUnavailable();
+    return { user: null, viewer: viewerFor(null, null, false) };
   }
-  if (board.is_private && !canReadForRole(roleName)) throw new RequestError("board_not_found", "Repository board was not found", 404);
+  let roleName: string | null;
+  try {
+    roleName = await collaboratorRole(board.owner, board.repo, user.login, token);
+  } catch (error) {
+    if (board.is_private) throw repositoryUnavailable();
+    console.error(JSON.stringify({ event: "permission_check_failed", board: board.full_name, error: error instanceof Error ? error.message : "unknown" }));
+    roleName = null;
+  }
+  if (board.is_private && !canReadForRole(roleName)) throw repositoryUnavailable();
   return { user, viewer: viewerFor(user, roleName, canMutateForRole(roleName)) };
+}
+
+async function resolveBoundRepository(env: Env, board: BoardRecord): Promise<{ token: string; repository: GitHubRepository }> {
+  try {
+    const installationId = await appInstallationForRepository(env, board.owner, board.repo);
+    if (installationId !== board.installation_id) throw new Error("installation identity changed");
+    const token = await installationToken(env, installationId);
+    if (!token) throw new Error("installation token unavailable");
+    const repository = await fetchRepository(board.owner, board.repo, token);
+    if (repository.id !== board.repository_id || repository.fullName.toLowerCase() !== board.full_name.toLowerCase()) {
+      throw new Error("repository identity changed");
+    }
+    board.is_private = repository.isPrivate ? 1 : 0;
+    board.html_url = repository.htmlUrl;
+    await env.DIRECTORY.prepare(
+      "UPDATE boards SET is_private = ?, html_url = ?, updated_at = ? WHERE id = ? AND repository_id = ? AND installation_id = ?",
+    ).bind(board.is_private, board.html_url, Date.now(), board.id, board.repository_id, board.installation_id).run();
+    await initializeBoard(env, board);
+    return { token, repository };
+  } catch (error) {
+    console.error(JSON.stringify({ event: "repository_binding_failed", board: board.full_name, error: error instanceof Error ? error.message : "unknown" }));
+    throw repositoryUnavailable();
+  }
+}
+
+async function resolveExistingPublicPreview(request: Request, env: Env, board: BoardRecord): Promise<BoardView> {
+  try {
+    const repository = await fetchPublicRepository(board.owner, board.repo);
+    if (!repository || repository.id !== board.repository_id || repository.fullName.toLowerCase() !== board.full_name.toLowerCase()) {
+      throw new Error("public repository identity changed");
+    }
+    board.is_private = 0;
+    board.html_url = repository.htmlUrl;
+    await env.DIRECTORY.prepare(
+      "UPDATE boards SET is_private = 0, html_url = ?, updated_at = ? WHERE id = ? AND repository_id = ?",
+    ).bind(repository.htmlUrl, Date.now(), board.id, board.repository_id).run();
+    await initializeBoard(env, board);
+    return virtualBoard(repository, viewerFor(await userFromRequest(request, env), null, false));
+  } catch {
+    throw repositoryUnavailable();
+  }
 }
 
 async function receiveWebhook(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -432,19 +485,29 @@ async function receiveWebhook(request: Request, env: Env, ctx: ExecutionContext)
   const repository = optionalRecord(payload.repository);
   if (!repository) return Response.json({ accepted: true }, { status: 202 });
   const fullName = optionalText(repository.full_name);
-  if (!fullName) return Response.json({ accepted: true }, { status: 202 });
-  const board = await env.DIRECTORY.prepare("SELECT id, owner, repo, full_name, repository_id, installation_id, is_private, html_url FROM boards WHERE lower(full_name) = lower(?)")
-    .bind(fullName).first<BoardRecord>();
+  const repositoryId = finiteInteger(repository.id);
+  const installationId = finiteInteger(optionalRecord(payload.installation)?.id);
+  if (!fullName || repositoryId === null || installationId === null) return Response.json({ accepted: true }, { status: 202 });
+  const board = await env.DIRECTORY.prepare("SELECT id, owner, repo, full_name, repository_id, installation_id, is_private, html_url FROM boards WHERE repository_id = ?")
+    .bind(repositoryId).first<BoardRecord>();
   if (!board) return Response.json({ accepted: true }, { status: 202 });
+  if (board.installation_id !== installationId || board.full_name.toLowerCase() !== fullName.toLowerCase()) {
+    console.error(JSON.stringify({ event: "webhook_repository_binding_mismatch", board: board.full_name, repositoryId, installationId }));
+    return Response.json({ accepted: true }, { status: 202 });
+  }
+
+  const numbers = webhookPullRequestNumbers(eventName, payload);
+  if (numbers.length === 0) return Response.json({ accepted: true }, { status: 202 });
 
   const isPrivate = Boolean(repository.private);
   const htmlUrl = optionalText(repository.html_url) ?? board.html_url;
-  await env.DIRECTORY.prepare("UPDATE boards SET is_private = ?, html_url = ?, updated_at = ? WHERE id = ?").bind(isPrivate ? 1 : 0, htmlUrl, now, board.id).run();
-  await boardStub(env, board.id).initialize({ id: board.id, owner: board.owner, repo: board.repo, fullName: board.full_name, htmlUrl, isPrivate });
+  await env.DIRECTORY.prepare("UPDATE boards SET is_private = ?, html_url = ?, updated_at = ? WHERE id = ? AND repository_id = ? AND installation_id = ?")
+    .bind(isPrivate ? 1 : 0, htmlUrl, now, board.id, repositoryId, installationId).run();
+  const updated = { ...board, is_private: isPrivate ? 1 : 0, html_url: htmlUrl };
+  await initializeBoard(env, updated);
   if (!await boardStub(env, board.id).beginWebhook(deliveryId, now)) return Response.json({ accepted: true, duplicate: true }, { status: 202 });
 
-  const numbers = pullRequestNumbers(payload);
-  ctx.waitUntil(reconcileBoard(env, { ...board, is_private: isPrivate ? 1 : 0, html_url: htmlUrl }, `webhook:${eventName}`, numbers));
+  ctx.waitUntil(reconcileBoard(env, updated, `webhook:${eventName}`, numbers));
   return Response.json({ accepted: true }, { status: 202 });
 }
 
@@ -466,34 +529,45 @@ async function updateInstallationFromWebhook(env: Env, payload: Record<string, u
 async function reconcileBoard(env: Env, board: BoardRecord, source: string, requestedNumbers?: number[]): Promise<void> {
   try {
     const stub = boardStub(env, board.id);
-    const linked = requestedNumbers?.length
-      ? requestedNumbers.map((number) => ({ taskId: "", number, nextReconcileAt: 0 }))
-      : source === "scheduled"
-        ? await stub.listPullRequestsDue(Date.now(), 25)
-        : await stub.listLinkedPullRequests(100);
+    const linked = await stub.reservePullRequestRefreshes(requestedNumbers ?? null, Date.now(), 25);
     if (linked.length === 0) return;
     const token = await installationToken(env, board.installation_id);
     for (const item of linked) {
-      const snapshot = await fetchPullRequestSnapshot(board.owner, board.repo, item.number, token);
-      unwrap(await stub.applyPullRequest(snapshot, source, Date.now()));
+      try {
+        const snapshot = await fetchPullRequestSnapshot(board.owner, board.repo, item.number, token);
+        unwrap(await stub.applyPullRequest(snapshot, source, Date.now(), item.generation));
+      } catch (error) {
+        await stub.recordPullRequestRefreshFailure(item.taskId, item.generation, Date.now());
+        console.error(JSON.stringify({ event: "pull_request_refresh_failed", board: board.full_name, source, pullRequest: item.number, error: error instanceof Error ? error.message : "unknown" }));
+      }
     }
   } catch (error) {
     console.error(JSON.stringify({ event: "pull_request_reconciliation_failed", board: board.full_name, source, error: error instanceof Error ? error.message : "unknown" }));
   }
 }
 
-function pullRequestNumbers(payload: Record<string, unknown>): number[] | undefined {
+export function webhookPullRequestNumbers(eventName: string, payload: Record<string, unknown>): number[] {
+  const action = optionalText(payload.action);
+  const allowedActions: Record<string, Set<string>> = {
+    pull_request: new Set(["opened", "reopened", "synchronize", "ready_for_review", "converted_to_draft", "closed", "edited", "review_requested", "review_request_removed"]),
+    pull_request_review: new Set(["submitted", "edited", "dismissed"]),
+    pull_request_review_comment: new Set(["created", "edited", "deleted"]),
+    issue_comment: new Set(["created", "edited", "deleted"]),
+    check_run: new Set(["created", "rerequested", "completed", "requested_action"]),
+    check_suite: new Set(["requested", "rerequested", "completed"]),
+  };
+  if (!action || !allowedActions[eventName]?.has(action)) return [];
   const direct = optionalRecord(payload.pull_request);
-  if (typeof direct?.number === "number") return [direct.number];
+  if (finiteInteger(direct?.number) !== null) return [finiteInteger(direct?.number)!];
   const issue = optionalRecord(payload.issue);
-  if (issue && optionalRecord(issue.pull_request) && typeof issue.number === "number") return [issue.number];
+  if (eventName === "issue_comment" && issue && optionalRecord(issue.pull_request) && finiteInteger(issue.number) !== null) return [finiteInteger(issue.number)!];
   for (const key of ["check_run", "check_suite"] as const) {
     const object = optionalRecord(payload[key]);
     if (!object || !Array.isArray(object.pull_requests)) continue;
-    const numbers = object.pull_requests.map(optionalRecord).map((pull) => pull?.number).filter((value): value is number => typeof value === "number");
-    if (numbers.length > 0) return [...new Set(numbers)];
+    const numbers = object.pull_requests.map(optionalRecord).map((pull) => finiteInteger(pull?.number)).filter((value): value is number => value !== null);
+    if (numbers.length > 0) return [...new Set(numbers)].slice(0, 20);
   }
-  return undefined;
+  return [];
 }
 
 async function boardRecord(env: Env, owner: string, repo: string): Promise<BoardRecord | null> {
@@ -503,6 +577,19 @@ async function boardRecord(env: Env, owner: string, repo: string): Promise<Board
 
 function boardStub(env: Env, id: string): DurableObjectStub<RepoBoard> {
   return env.REPO_BOARD.getByName(id);
+}
+
+async function initializeBoard(env: Env, board: BoardRecord): Promise<void> {
+  await boardStub(env, board.id).initialize({
+    id: board.id,
+    owner: board.owner,
+    repo: board.repo,
+    fullName: board.full_name,
+    repositoryId: board.repository_id,
+    installationId: board.installation_id,
+    htmlUrl: board.html_url,
+    isPrivate: Boolean(board.is_private),
+  });
 }
 
 function boardSummary(board: BoardRecord): BoardSummary {
@@ -555,6 +642,10 @@ function optionalRecord(value: unknown): Record<string, unknown> | null {
 
 function optionalText(value: unknown): string | null {
   return typeof value === "string" ? value : null;
+}
+
+function finiteInteger(value: unknown): number | null {
+  return Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : null;
 }
 
 function errorResponse(error: unknown): Response {

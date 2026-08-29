@@ -17,10 +17,10 @@ export function parseCommandEnvelope(value: unknown): CommandEnvelope {
 
   switch (type) {
     case "create_task":
-      command = { type, title: boundedString(commandObject.title, "title", 1, 120), description: boundedString(commandObject.description ?? "", "description", 0, 10_000) };
+      command = { type, title: singleLineString(commandObject.title, "title", 1, 120), description: boundedString(commandObject.description ?? "", "description", 0, 10_000) };
       break;
     case "edit_task":
-      command = { type, taskId: identifier(commandObject.taskId, "taskId"), title: boundedString(commandObject.title, "title", 1, 120), description: boundedString(commandObject.description ?? "", "description", 0, 10_000) };
+      command = { type, taskId: identifier(commandObject.taskId, "taskId"), title: singleLineString(commandObject.title, "title", 1, 120), description: boundedString(commandObject.description ?? "", "description", 0, 10_000) };
       break;
     case "claim_task":
       command = {
@@ -82,6 +82,12 @@ export function boundedString(value: unknown, name: string, min: number, max: nu
   if (typeof value !== "string") throw new ValidationError("invalid_string", `${name} must be a string`);
   const result = value.trim();
   if (result.length < min || result.length > max) throw new ValidationError("invalid_length", `${name} must contain ${min} to ${max} characters`);
+  return result;
+}
+
+export function singleLineString(value: unknown, name: string, min: number, max: number): string {
+  const result = boundedString(value, name, min, max);
+  if (/[\p{Cc}\p{Zl}\p{Zp}]/u.test(result)) throw new ValidationError("invalid_control_character", `${name} must be a single line without control characters`);
   return result;
 }
 

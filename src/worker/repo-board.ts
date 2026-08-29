@@ -30,12 +30,19 @@ import {
 const LEASE_MS = 15 * 60 * 1_000;
 const RECONCILE_MS = 5 * 60 * 1_000;
 const MAX_TASKS = 200;
+const MAX_TOTAL_TASKS = 1_000;
+const MAX_RECEIPTS = 2_000;
+const MAX_HISTORY_ROWS = 5_000;
+const ACTION_RECEIPT_MS = 24 * 60 * 60 * 1_000;
+const WEBHOOK_RECEIPT_MS = 7 * 24 * 60 * 60 * 1_000;
 
 interface BoardMetadata {
   id: string;
   owner: string;
   repo: string;
   fullName: string;
+  repositoryId: number;
+  installationId: number;
   htmlUrl: string;
   isPrivate: boolean;
 }
@@ -85,6 +92,7 @@ interface LinkedPullRequest {
   taskId: string;
   number: number;
   nextReconcileAt: number;
+  generation: number;
 }
 
 export class RepoBoard extends DurableObject<Env> {
@@ -96,16 +104,31 @@ export class RepoBoard extends DurableObject<Env> {
   async initialize(metadata: BoardMetadata): Promise<void> {
     const existing = this.getMetadata();
     if (existing) {
-      if (existing.fullName !== metadata.fullName) throw new Error("Board identity cannot change");
-      this.ctx.storage.sql.exec("UPDATE board_metadata SET html_url = ?, is_private = ? WHERE id = ?", metadata.htmlUrl, metadata.isPrivate ? 1 : 0, metadata.id);
+      if (existing.fullName.toLowerCase() !== metadata.fullName.toLowerCase()
+        || (existing.repositoryId !== 0 && existing.repositoryId !== metadata.repositoryId)
+        || (existing.installationId !== 0 && existing.installationId !== metadata.installationId)) {
+        throw new Error("Board identity cannot change");
+      }
+      const accessChanged = existing.isPrivate !== metadata.isPrivate;
+      this.ctx.storage.sql.exec(
+        "UPDATE board_metadata SET repository_id = ?, installation_id = ?, html_url = ?, is_private = ? WHERE id = ?",
+        metadata.repositoryId,
+        metadata.installationId,
+        metadata.htmlUrl,
+        metadata.isPrivate ? 1 : 0,
+        metadata.id,
+      );
+      if (accessChanged) for (const socket of this.ctx.getWebSockets()) socket.close(4002, "Repository access changed");
       return;
     }
     this.ctx.storage.sql.exec(
-      "INSERT INTO board_metadata (id, owner, repo, full_name, html_url, is_private, revision) VALUES (?, ?, ?, ?, ?, ?, 0)",
+      "INSERT INTO board_metadata (id, owner, repo, full_name, repository_id, installation_id, html_url, is_private, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
       metadata.id,
       metadata.owner,
       metadata.repo,
       metadata.fullName,
+      metadata.repositoryId,
+      metadata.installationId,
       metadata.htmlUrl,
       metadata.isPrivate ? 1 : 0,
     );
@@ -122,11 +145,12 @@ export class RepoBoard extends DurableObject<Env> {
     if (!metadata) return failure("board_not_initialized", "Board has not been initialized", 404);
 
     const processed = this.ctx.storage.sql
-      .exec<{ actor_user_id: string; result_json: string }>("SELECT actor_user_id, result_json FROM processed_actions WHERE action_id = ?", envelope.actionId)
+      .exec<{ actor_user_id: string; result_json: string; processed_at: number }>("SELECT actor_user_id, result_json, processed_at FROM processed_actions WHERE action_id = ?", envelope.actionId)
       .toArray()[0];
     if (processed) {
       if (processed.actor_user_id !== actor.userId) return failure("action_owner_mismatch", "Action ID was already used by another user", 409);
-      return JSON.parse(processed.result_json) as RpcResult<BoardView>;
+      if (processed.processed_at >= now - ACTION_RECEIPT_MS) return success(this.buildView(metadata, viewer, false));
+      this.ctx.storage.sql.exec("DELETE FROM processed_actions WHERE action_id = ?", envelope.actionId);
     }
 
     const currentRevision = this.currentRevision();
@@ -157,9 +181,10 @@ export class RepoBoard extends DurableObject<Env> {
           "INSERT INTO processed_actions (action_id, actor_user_id, result_json, processed_at) VALUES (?, ?, ?, ?)",
           envelope.actionId,
           actor.userId,
-          JSON.stringify(result),
+          JSON.stringify({ revision: currentRevision + 1 }),
           now,
         );
+        this.compactStorage(now);
       });
       this.broadcast(currentRevision + 1);
       await this.rescheduleAlarm();
@@ -180,9 +205,11 @@ export class RepoBoard extends DurableObject<Env> {
   }
 
   async beginWebhook(deliveryId: string, now: number): Promise<boolean> {
+    this.ctx.storage.sql.exec("DELETE FROM processed_webhooks WHERE processed_at < ?", now - WEBHOOK_RECEIPT_MS);
     const seen = this.ctx.storage.sql.exec<{ delivery_id: string }>("SELECT delivery_id FROM processed_webhooks WHERE delivery_id = ?", deliveryId).toArray()[0];
     if (seen) return false;
     this.ctx.storage.sql.exec("INSERT INTO processed_webhooks (delivery_id, processed_at) VALUES (?, ?)", deliveryId, now);
+    this.ctx.storage.sql.exec("DELETE FROM processed_webhooks WHERE delivery_id NOT IN (SELECT delivery_id FROM processed_webhooks ORDER BY processed_at DESC LIMIT ?)", MAX_RECEIPTS);
     return true;
   }
 
@@ -192,55 +219,65 @@ export class RepoBoard extends DurableObject<Env> {
     return success({ taskId, number: row.linked_pr_number });
   }
 
-  async listPullRequestsDue(now: number, limit = 25): Promise<LinkedPullRequest[]> {
-    return this.ctx.storage.sql
-      .exec<{ task_id: string; pr_number: number; next_reconcile_at: number }>(
-        `SELECT pr.task_id, pr.pr_number, pr.next_reconcile_at
-         FROM pr_snapshots pr JOIN tasks task ON task.id = pr.task_id
-         WHERE task.archived_at IS NULL AND (pr.reconcile_due = 1 OR pr.next_reconcile_at <= ?)
-         ORDER BY pr.next_reconcile_at LIMIT ?`,
-        now,
-        limit,
-      )
-      .toArray()
-      .map((row) => ({ taskId: row.task_id, number: row.pr_number, nextReconcileAt: row.next_reconcile_at }));
+  async reservePullRequestRefresh(taskId: string): Promise<RpcResult<LinkedPullRequest>> {
+    const row = this.ctx.storage.sql.exec<{ task_id: string; pr_number: number; next_reconcile_at: number; refresh_generation: number }>(
+      `SELECT pr.task_id, pr.pr_number, pr.next_reconcile_at, pr.refresh_generation
+       FROM pr_snapshots pr JOIN tasks task ON task.id = pr.task_id
+       WHERE pr.task_id = ? AND task.archived_at IS NULL`,
+      taskId,
+    ).toArray()[0];
+    if (!row) return failure("pull_request_not_linked", "Task has no linked pull request", 404);
+    const generation = row.refresh_generation + 1;
+    this.ctx.storage.sql.exec("UPDATE pr_snapshots SET refresh_generation = ? WHERE task_id = ?", generation, taskId);
+    return success({ taskId, number: row.pr_number, nextReconcileAt: row.next_reconcile_at, generation });
   }
 
-  async listLinkedPullRequests(limit = 100): Promise<LinkedPullRequest[]> {
-    return this.ctx.storage.sql
-      .exec<{ task_id: string; pr_number: number; next_reconcile_at: number }>(
-        `SELECT pr.task_id, pr.pr_number, pr.next_reconcile_at
-         FROM pr_snapshots pr JOIN tasks task ON task.id = pr.task_id
-         WHERE task.archived_at IS NULL ORDER BY pr.task_id LIMIT ?`,
-        limit,
-      )
-      .toArray()
-      .map((row) => ({ taskId: row.task_id, number: row.pr_number, nextReconcileAt: row.next_reconcile_at }));
+  async reservePullRequestRefreshes(numbers: number[] | null, now: number, limit = 25): Promise<LinkedPullRequest[]> {
+    const boundedLimit = Math.max(1, Math.min(25, limit));
+    const requested = numbers ? [...new Set(numbers)].slice(0, 20) : null;
+    if (requested && requested.length === 0) return [];
+    const placeholders = requested?.map(() => "?").join(", ");
+    const rows = this.ctx.storage.sql.exec<{ task_id: string; pr_number: number; next_reconcile_at: number; refresh_generation: number }>(
+      `SELECT pr.task_id, pr.pr_number, pr.next_reconcile_at, pr.refresh_generation
+       FROM pr_snapshots pr JOIN tasks task ON task.id = pr.task_id
+       WHERE task.archived_at IS NULL AND ${requested ? `pr.pr_number IN (${placeholders})` : "(pr.reconcile_due = 1 OR pr.next_reconcile_at <= ?)"}
+       ORDER BY pr.failure_count, pr.next_reconcile_at, pr.task_id LIMIT ?`,
+      ...(requested ?? [now]),
+      boundedLimit,
+    ).toArray();
+    return this.ctx.storage.transactionSync(() => rows.map((row) => {
+      const generation = row.refresh_generation + 1;
+      this.ctx.storage.sql.exec("UPDATE pr_snapshots SET refresh_generation = ?, reconcile_due = 0 WHERE task_id = ?", generation, row.task_id);
+      return { taskId: row.task_id, number: row.pr_number, nextReconcileAt: row.next_reconcile_at, generation };
+    }));
   }
 
-  async applyPullRequest(snapshot: PullRequestSnapshot, source: string, now: number): Promise<RpcResult<BoardView | null>> {
+  async applyPullRequest(snapshot: PullRequestSnapshot, source: string, now: number, generation?: number): Promise<RpcResult<BoardView | null>> {
     const metadata = this.getMetadata();
     if (!metadata) return failure("board_not_initialized", "Board has not been initialized", 404);
     const task = this.ctx.storage.sql.exec<TaskRow>("SELECT * FROM tasks WHERE linked_pr_number = ?", snapshot.number).toArray()[0];
     if (!task || task.archived_at !== null) return success(null);
 
-    const existing = this.ctx.storage.sql.exec<{ snapshot_json: string }>("SELECT snapshot_json FROM pr_snapshots WHERE task_id = ?", task.id).toArray()[0];
+    const existing = this.ctx.storage.sql.exec<{ snapshot_json: string; applied_generation: number }>("SELECT snapshot_json, applied_generation FROM pr_snapshots WHERE task_id = ?", task.id).toArray()[0];
     const previous = existing ? (JSON.parse(existing.snapshot_json) as PullRequestSnapshot) : null;
-    if (previous && snapshot.syncedAt < previous.syncedAt) return success(null);
+    if (generation !== undefined && existing && generation <= existing.applied_generation) return success(null);
+    if (generation === undefined && previous && snapshot.syncedAt < previous.syncedAt) return success(null);
     const nextColumn = columnForPullRequest(snapshot);
     const materiallyChanged = !previous || JSON.stringify({ ...previous, syncedAt: 0 }) !== JSON.stringify({ ...snapshot, syncedAt: 0 }) || task.column_name !== nextColumn;
 
     const revision = this.currentRevision() + (materiallyChanged ? 1 : 0);
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec(
-        `INSERT INTO pr_snapshots (task_id, pr_number, snapshot_json, next_reconcile_at, reconcile_due)
-         VALUES (?, ?, ?, ?, 0)
+        `INSERT INTO pr_snapshots (task_id, pr_number, snapshot_json, next_reconcile_at, reconcile_due, applied_generation, failure_count)
+         VALUES (?, ?, ?, ?, 0, ?, 0)
          ON CONFLICT(task_id) DO UPDATE SET pr_number = excluded.pr_number, snapshot_json = excluded.snapshot_json,
-         next_reconcile_at = excluded.next_reconcile_at, reconcile_due = 0`,
+         next_reconcile_at = excluded.next_reconcile_at, reconcile_due = 0,
+         applied_generation = MAX(pr_snapshots.applied_generation, excluded.applied_generation), failure_count = 0`,
         task.id,
         snapshot.number,
         JSON.stringify(snapshot),
         now + RECONCILE_MS,
+        generation ?? existing?.applied_generation ?? 0,
       );
       if (!materiallyChanged) return;
       this.ctx.storage.sql.exec(
@@ -258,6 +295,7 @@ export class RepoBoard extends DurableObject<Env> {
       }
       this.ctx.storage.sql.exec("UPDATE board_metadata SET revision = ? WHERE id = ?", revision, metadata.id);
       this.insertEvent(revision, snapshot.merged ? "pull_request_merged" : snapshot.state === "closed" ? "pull_request_closed" : "pull_request_updated", task.id, "github", now, { source, pullRequest: snapshot.number, column: nextColumn });
+      this.compactStorage(now);
     });
     if (!materiallyChanged) {
       await this.rescheduleAlarm();
@@ -266,6 +304,22 @@ export class RepoBoard extends DurableObject<Env> {
     this.broadcast(revision);
     await this.rescheduleAlarm();
     return success(this.buildView(metadata, systemViewer(), false));
+  }
+
+  async recordPullRequestRefreshFailure(taskId: string, generation: number, now: number): Promise<void> {
+    const row = this.ctx.storage.sql.exec<{ applied_generation: number; failure_count: number }>(
+      "SELECT applied_generation, failure_count FROM pr_snapshots WHERE task_id = ?",
+      taskId,
+    ).toArray()[0];
+    if (!row || generation <= row.applied_generation) return;
+    const failureCount = Math.min(row.failure_count + 1, 6);
+    this.ctx.storage.sql.exec(
+      "UPDATE pr_snapshots SET failure_count = ?, next_reconcile_at = ?, reconcile_due = 0 WHERE task_id = ?",
+      failureCount,
+      now + RECONCILE_MS,
+      taskId,
+    );
+    await this.rescheduleAlarm();
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -299,25 +353,8 @@ export class RepoBoard extends DurableObject<Env> {
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    if (typeof message !== "string") return;
-    let parsed: { type?: string; revision?: number };
-    try {
-      parsed = JSON.parse(message) as { type?: string; revision?: number };
-    } catch {
-      ws.close(1003, "Invalid message");
-      return;
-    }
-    if (parsed.type !== "resync") return;
-    const attachment = ws.deserializeAttachment() as SocketAttachment | null;
-    const metadata = this.getMetadata();
-    if (!attachment || !metadata) return;
-    const revision = this.currentRevision();
-    ws.send(JSON.stringify({
-      type: "snapshot",
-      revision,
-      board: this.buildView(metadata, attachment.viewer, false),
-      events: this.eventsSince(Number(parsed.revision ?? 0)),
-    } satisfies BoardSocketMessage));
+    void message;
+    ws.close(1008, "Client messages are not supported");
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
@@ -356,6 +393,7 @@ export class RepoBoard extends DurableObject<Env> {
       for (const pullRequest of duePullRequests) {
         this.insertEvent(revision, "pull_request_reconciliation_due", pullRequest.task_id, "system", now, {});
       }
+      this.compactStorage(now);
     });
 
     for (const socket of this.ctx.getWebSockets()) {
@@ -372,6 +410,8 @@ export class RepoBoard extends DurableObject<Env> {
       case "create_task": {
         const count = this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM tasks WHERE archived_at IS NULL").one().count;
         if (count >= MAX_TASKS) throw new BoardError("task_limit", "Board already has the maximum number of active tasks", 409);
+        const totalCount = this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM tasks").one().count;
+        if (totalCount >= MAX_TOTAL_TASKS) throw new BoardError("task_history_limit", "Board task history is full", 409);
         const taskId = crypto.randomUUID();
         const taskReference = this.allocateTaskReference(taskId);
         this.ctx.storage.sql.exec(
@@ -646,11 +686,30 @@ export class RepoBoard extends DurableObject<Env> {
         this.ctx.storage.sql.exec("INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (4, ?)", Date.now());
       });
     }
+    if (migration < 5) {
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec("ALTER TABLE board_metadata ADD COLUMN repository_id INTEGER NOT NULL DEFAULT 0");
+        this.ctx.storage.sql.exec("ALTER TABLE board_metadata ADD COLUMN installation_id INTEGER NOT NULL DEFAULT 0");
+        this.ctx.storage.sql.exec("ALTER TABLE pr_snapshots ADD COLUMN refresh_generation INTEGER NOT NULL DEFAULT 0");
+        this.ctx.storage.sql.exec("ALTER TABLE pr_snapshots ADD COLUMN applied_generation INTEGER NOT NULL DEFAULT 0");
+        this.ctx.storage.sql.exec("ALTER TABLE pr_snapshots ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0");
+        this.ctx.storage.sql.exec("INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (5, ?)", Date.now());
+      });
+    }
   }
 
   private getMetadata(): BoardMetadata | null {
-    const row = this.ctx.storage.sql.exec<{ id: string; owner: string; repo: string; full_name: string; html_url: string; is_private: number }>("SELECT id, owner, repo, full_name, html_url, is_private FROM board_metadata LIMIT 1").toArray()[0];
-    return row ? { id: row.id, owner: row.owner, repo: row.repo, fullName: row.full_name, htmlUrl: row.html_url, isPrivate: Boolean(row.is_private) } : null;
+    const row = this.ctx.storage.sql.exec<{ id: string; owner: string; repo: string; full_name: string; repository_id: number; installation_id: number; html_url: string; is_private: number }>("SELECT id, owner, repo, full_name, repository_id, installation_id, html_url, is_private FROM board_metadata LIMIT 1").toArray()[0];
+    return row ? {
+      id: row.id,
+      owner: row.owner,
+      repo: row.repo,
+      fullName: row.full_name,
+      repositoryId: row.repository_id,
+      installationId: row.installation_id,
+      htmlUrl: row.html_url,
+      isPrivate: Boolean(row.is_private),
+    } : null;
   }
 
   private currentRevision(): number {
@@ -738,6 +797,25 @@ export class RepoBoard extends DurableObject<Env> {
     );
   }
 
+  private compactStorage(now: number): void {
+    this.ctx.storage.sql.exec("DELETE FROM processed_actions WHERE processed_at < ?", now - ACTION_RECEIPT_MS);
+    this.ctx.storage.sql.exec("DELETE FROM processed_actions WHERE action_id NOT IN (SELECT action_id FROM processed_actions ORDER BY processed_at DESC LIMIT ?)", MAX_RECEIPTS);
+    this.ctx.storage.sql.exec("DELETE FROM processed_webhooks WHERE processed_at < ?", now - WEBHOOK_RECEIPT_MS);
+    this.ctx.storage.sql.exec("DELETE FROM processed_webhooks WHERE delivery_id NOT IN (SELECT delivery_id FROM processed_webhooks ORDER BY processed_at DESC LIMIT ?)", MAX_RECEIPTS);
+    this.ctx.storage.sql.exec("DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT ?)", MAX_HISTORY_ROWS);
+    this.ctx.storage.sql.exec("DELETE FROM progress_reports WHERE id NOT IN (SELECT id FROM progress_reports ORDER BY reported_at DESC LIMIT ?)", MAX_HISTORY_ROWS);
+    this.ctx.storage.sql.exec("DELETE FROM assignments WHERE status != 'active' AND id NOT IN (SELECT id FROM assignments WHERE status != 'active' ORDER BY last_activity_at DESC LIMIT ?)", MAX_HISTORY_ROWS);
+    this.ctx.storage.sql.exec("DELETE FROM task_revisions WHERE (task_id, revision) NOT IN (SELECT task_id, revision FROM task_revisions ORDER BY created_at DESC LIMIT ?)", MAX_HISTORY_ROWS);
+    this.ctx.storage.sql.exec(
+      `DELETE FROM plan_revisions WHERE (task_id, revision) NOT IN (
+         SELECT task_id, revision FROM plan_revisions ORDER BY created_at DESC LIMIT ?
+       ) AND (task_id, revision) NOT IN (
+         SELECT id, latest_plan_revision FROM tasks WHERE latest_plan_revision > 0
+       )`,
+      MAX_HISTORY_ROWS,
+    );
+  }
+
   private buildView(metadata: BoardMetadata, viewer: Viewer, includeArchived: boolean): BoardView {
     const tasks = this.ctx.storage.sql
       .exec<TaskRow>(`SELECT * FROM tasks ${includeArchived ? "" : "WHERE archived_at IS NULL"} ORDER BY created_at ASC LIMIT ?`, MAX_TASKS)
@@ -746,7 +824,19 @@ export class RepoBoard extends DurableObject<Env> {
     const archivedTaskCount = this.ctx.storage.sql
       .exec<{ count: number }>("SELECT COUNT(*) AS count FROM tasks WHERE archived_at IS NOT NULL")
       .one().count;
-    return { ...metadata, materialized: true, revision: this.currentRevision(), viewer, archivedTaskCount, tasks };
+    return {
+      id: metadata.id,
+      owner: metadata.owner,
+      repo: metadata.repo,
+      fullName: metadata.fullName,
+      htmlUrl: metadata.htmlUrl,
+      isPrivate: metadata.isPrivate,
+      materialized: true,
+      revision: this.currentRevision(),
+      viewer,
+      archivedTaskCount,
+      tasks,
+    };
   }
 
   private buildTaskView(task: TaskRow, viewer: Viewer): TaskView {
