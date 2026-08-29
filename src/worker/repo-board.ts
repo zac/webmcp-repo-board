@@ -91,7 +91,6 @@ interface SocketAttachment {
 interface LinkedPullRequest {
   taskId: string;
   number: number;
-  nextReconcileAt: number;
   generation: number;
 }
 
@@ -104,9 +103,7 @@ export class RepoBoard extends DurableObject<Env> {
   async initialize(metadata: BoardMetadata): Promise<void> {
     const existing = this.getMetadata();
     if (existing) {
-      if (existing.fullName.toLowerCase() !== metadata.fullName.toLowerCase()
-        || (existing.repositoryId !== 0 && existing.repositoryId !== metadata.repositoryId)
-        || (existing.installationId !== 0 && existing.installationId !== metadata.installationId)) {
+      if (!boardIdentityMatches(existing, metadata)) {
         throw new Error("Board identity cannot change");
       }
       const accessChanged = existing.isPrivate !== metadata.isPrivate;
@@ -145,7 +142,7 @@ export class RepoBoard extends DurableObject<Env> {
     if (!metadata) return failure("board_not_initialized", "Board has not been initialized", 404);
 
     const processed = this.ctx.storage.sql
-      .exec<{ actor_user_id: string; result_json: string; processed_at: number }>("SELECT actor_user_id, result_json, processed_at FROM processed_actions WHERE action_id = ?", envelope.actionId)
+      .exec<{ actor_user_id: string; processed_at: number }>("SELECT actor_user_id, processed_at FROM processed_actions WHERE action_id = ?", envelope.actionId)
       .toArray()[0];
     if (processed) {
       if (processed.actor_user_id !== actor.userId) return failure("action_owner_mismatch", "Action ID was already used by another user", 409);
@@ -178,10 +175,10 @@ export class RepoBoard extends DurableObject<Env> {
         this.insertEvent(currentRevision + 1, event.type, event.taskId, actor.login, now, event.data);
         result = success(this.buildView(metadata, viewer, false));
         this.ctx.storage.sql.exec(
-          "INSERT INTO processed_actions (action_id, actor_user_id, result_json, processed_at) VALUES (?, ?, ?, ?)",
+          "INSERT INTO processed_actions (action_id, actor_user_id, revision, processed_at) VALUES (?, ?, ?, ?)",
           envelope.actionId,
           actor.userId,
-          JSON.stringify({ revision: currentRevision + 1 }),
+          currentRevision + 1,
           now,
         );
         this.compactStorage(now);
@@ -213,15 +210,9 @@ export class RepoBoard extends DurableObject<Env> {
     return true;
   }
 
-  async getLinkedPullRequest(taskId: string): Promise<RpcResult<{ taskId: string; number: number }>> {
-    const row = this.ctx.storage.sql.exec<TaskRow>("SELECT * FROM tasks WHERE id = ?", taskId).toArray()[0];
-    if (!row || row.linked_pr_number === null) return failure("pull_request_not_linked", "Task has no linked pull request", 404);
-    return success({ taskId, number: row.linked_pr_number });
-  }
-
   async reservePullRequestRefresh(taskId: string): Promise<RpcResult<LinkedPullRequest>> {
-    const row = this.ctx.storage.sql.exec<{ task_id: string; pr_number: number; next_reconcile_at: number; refresh_generation: number }>(
-      `SELECT pr.task_id, pr.pr_number, pr.next_reconcile_at, pr.refresh_generation
+    const row = this.ctx.storage.sql.exec<{ task_id: string; pr_number: number; refresh_generation: number }>(
+      `SELECT pr.task_id, pr.pr_number, pr.refresh_generation
        FROM pr_snapshots pr JOIN tasks task ON task.id = pr.task_id
        WHERE pr.task_id = ? AND task.archived_at IS NULL`,
       taskId,
@@ -229,7 +220,7 @@ export class RepoBoard extends DurableObject<Env> {
     if (!row) return failure("pull_request_not_linked", "Task has no linked pull request", 404);
     const generation = row.refresh_generation + 1;
     this.ctx.storage.sql.exec("UPDATE pr_snapshots SET refresh_generation = ? WHERE task_id = ?", generation, taskId);
-    return success({ taskId, number: row.pr_number, nextReconcileAt: row.next_reconcile_at, generation });
+    return success({ taskId, number: row.pr_number, generation });
   }
 
   async reservePullRequestRefreshes(numbers: number[] | null, now: number, limit = 25): Promise<LinkedPullRequest[]> {
@@ -237,8 +228,8 @@ export class RepoBoard extends DurableObject<Env> {
     const requested = numbers ? [...new Set(numbers)].slice(0, 20) : null;
     if (requested && requested.length === 0) return [];
     const placeholders = requested?.map(() => "?").join(", ");
-    const rows = this.ctx.storage.sql.exec<{ task_id: string; pr_number: number; next_reconcile_at: number; refresh_generation: number }>(
-      `SELECT pr.task_id, pr.pr_number, pr.next_reconcile_at, pr.refresh_generation
+    const rows = this.ctx.storage.sql.exec<{ task_id: string; pr_number: number; refresh_generation: number }>(
+      `SELECT pr.task_id, pr.pr_number, pr.refresh_generation
        FROM pr_snapshots pr JOIN tasks task ON task.id = pr.task_id
        WHERE task.archived_at IS NULL AND ${requested ? `pr.pr_number IN (${placeholders})` : "(pr.reconcile_due = 1 OR pr.next_reconcile_at <= ?)"}
        ORDER BY pr.failure_count, pr.next_reconcile_at, pr.task_id LIMIT ?`,
@@ -248,36 +239,33 @@ export class RepoBoard extends DurableObject<Env> {
     return this.ctx.storage.transactionSync(() => rows.map((row) => {
       const generation = row.refresh_generation + 1;
       this.ctx.storage.sql.exec("UPDATE pr_snapshots SET refresh_generation = ?, reconcile_due = 0 WHERE task_id = ?", generation, row.task_id);
-      return { taskId: row.task_id, number: row.pr_number, nextReconcileAt: row.next_reconcile_at, generation };
+      return { taskId: row.task_id, number: row.pr_number, generation };
     }));
   }
 
-  async applyPullRequest(snapshot: PullRequestSnapshot, source: string, now: number, generation?: number): Promise<RpcResult<BoardView | null>> {
+  async applyPullRequest(snapshot: PullRequestSnapshot, source: string, now: number, generation: number): Promise<RpcResult<BoardView | null>> {
     const metadata = this.getMetadata();
     if (!metadata) return failure("board_not_initialized", "Board has not been initialized", 404);
     const task = this.ctx.storage.sql.exec<TaskRow>("SELECT * FROM tasks WHERE linked_pr_number = ?", snapshot.number).toArray()[0];
     if (!task || task.archived_at !== null) return success(null);
 
     const existing = this.ctx.storage.sql.exec<{ snapshot_json: string; applied_generation: number }>("SELECT snapshot_json, applied_generation FROM pr_snapshots WHERE task_id = ?", task.id).toArray()[0];
-    const previous = existing ? (JSON.parse(existing.snapshot_json) as PullRequestSnapshot) : null;
-    if (generation !== undefined && existing && generation <= existing.applied_generation) return success(null);
-    if (generation === undefined && previous && snapshot.syncedAt < previous.syncedAt) return success(null);
+    if (!existing) return failure("pull_request_state_missing", "Linked pull request state is missing", 500);
+    const previous = JSON.parse(existing.snapshot_json) as PullRequestSnapshot;
+    if (generation <= existing.applied_generation) return success(null);
     const nextColumn = columnForPullRequest(snapshot);
     const materiallyChanged = !previous || JSON.stringify({ ...previous, syncedAt: 0 }) !== JSON.stringify({ ...snapshot, syncedAt: 0 }) || task.column_name !== nextColumn;
 
     const revision = this.currentRevision() + (materiallyChanged ? 1 : 0);
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec(
-        `INSERT INTO pr_snapshots (task_id, pr_number, snapshot_json, next_reconcile_at, reconcile_due, applied_generation, failure_count)
-         VALUES (?, ?, ?, ?, 0, ?, 0)
-         ON CONFLICT(task_id) DO UPDATE SET pr_number = excluded.pr_number, snapshot_json = excluded.snapshot_json,
-         next_reconcile_at = excluded.next_reconcile_at, reconcile_due = 0,
-         applied_generation = MAX(pr_snapshots.applied_generation, excluded.applied_generation), failure_count = 0`,
-        task.id,
+        `UPDATE pr_snapshots SET pr_number = ?, snapshot_json = ?, next_reconcile_at = ?, reconcile_due = 0,
+         applied_generation = ?, failure_count = 0 WHERE task_id = ?`,
         snapshot.number,
         JSON.stringify(snapshot),
         now + RECONCILE_MS,
-        generation ?? existing?.applied_generation ?? 0,
+        generation,
+        task.id,
       );
       if (!materiallyChanged) return;
       this.ctx.storage.sql.exec(
@@ -559,7 +547,10 @@ export class RepoBoard extends DurableObject<Env> {
         this.renewAssignment(assignment.id, now, "waiting", `Linked PR #${command.snapshot.number}`, parseStats(assignment.stats_json));
         this.ctx.storage.sql.exec("UPDATE tasks SET column_name = 'in_pr', linked_pr_number = ?, updated_at = ?, task_revision = ? WHERE id = ?", command.snapshot.number, now, revision, task.id);
         this.ctx.storage.sql.exec(
-          "INSERT INTO pr_snapshots (task_id, pr_number, snapshot_json, next_reconcile_at, reconcile_due) VALUES (?, ?, ?, ?, 0)",
+          `INSERT INTO pr_snapshots (
+             task_id, pr_number, snapshot_json, next_reconcile_at, reconcile_due,
+             refresh_generation, applied_generation, failure_count
+           ) VALUES (?, ?, ?, ?, 0, 0, 0, 0)`,
           task.id,
           command.snapshot.number,
           JSON.stringify(command.snapshot),
@@ -603,18 +594,23 @@ export class RepoBoard extends DurableObject<Env> {
 
   private migrate(): void {
     this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS _sql_schema_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS board_metadata (
         id TEXT PRIMARY KEY, owner TEXT NOT NULL, repo TEXT NOT NULL, full_name TEXT NOT NULL,
+        repository_id INTEGER NOT NULL, installation_id INTEGER NOT NULL,
         html_url TEXT NOT NULL, is_private INTEGER NOT NULL, revision INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS tasks (
-        id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, column_name TEXT NOT NULL,
+        id TEXT PRIMARY KEY, task_reference TEXT NOT NULL UNIQUE CHECK(task_reference != ''),
+        title TEXT NOT NULL, description TEXT NOT NULL, column_name TEXT NOT NULL,
         archived_at INTEGER, created_by TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-        task_revision INTEGER NOT NULL, latest_plan_revision INTEGER NOT NULL, linked_pr_number INTEGER
+        task_revision INTEGER NOT NULL, latest_plan_revision INTEGER NOT NULL, linked_pr_number INTEGER,
+        resolution TEXT, resolution_reason TEXT, resolved_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS tasks_column_idx ON tasks(column_name, archived_at);
       CREATE UNIQUE INDEX IF NOT EXISTS tasks_linked_pr_idx ON tasks(linked_pr_number) WHERE linked_pr_number IS NOT NULL;
+      CREATE TRIGGER IF NOT EXISTS tasks_reference_immutable BEFORE UPDATE OF task_reference ON tasks
+      WHEN OLD.task_reference IS NOT NEW.task_reference
+      BEGIN SELECT RAISE(ABORT, 'task_reference is immutable'); END;
       CREATE TABLE IF NOT EXISTS task_revisions (
         task_id TEXT NOT NULL, revision INTEGER NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL,
         author_user_id TEXT NOT NULL, author_login TEXT NOT NULL, created_at INTEGER NOT NULL,
@@ -626,7 +622,8 @@ export class RepoBoard extends DurableObject<Env> {
         PRIMARY KEY(task_id, revision)
       );
       CREATE TABLE IF NOT EXISTS assignments (
-        id TEXT PRIMARY KEY, task_id TEXT NOT NULL, kind TEXT NOT NULL, user_id TEXT NOT NULL, user_login TEXT NOT NULL,
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL, kind TEXT NOT NULL, focus TEXT NOT NULL,
+        user_id TEXT NOT NULL, user_login TEXT NOT NULL,
         agent_label TEXT NOT NULL, status TEXT NOT NULL, claimed_at INTEGER NOT NULL, last_activity_at INTEGER NOT NULL,
         lease_expires_at INTEGER NOT NULL, phase TEXT NOT NULL, summary TEXT NOT NULL, stats_json TEXT NOT NULL
       );
@@ -637,7 +634,8 @@ export class RepoBoard extends DurableObject<Env> {
       );
       CREATE TABLE IF NOT EXISTS pr_snapshots (
         task_id TEXT PRIMARY KEY, pr_number INTEGER NOT NULL UNIQUE, snapshot_json TEXT NOT NULL,
-        next_reconcile_at INTEGER NOT NULL, reconcile_due INTEGER NOT NULL
+        next_reconcile_at INTEGER NOT NULL, reconcile_due INTEGER NOT NULL,
+        refresh_generation INTEGER NOT NULL, applied_generation INTEGER NOT NULL, failure_count INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT, revision INTEGER NOT NULL, event_type TEXT NOT NULL, task_id TEXT,
@@ -645,57 +643,12 @@ export class RepoBoard extends DurableObject<Env> {
       );
       CREATE INDEX IF NOT EXISTS events_revision_idx ON events(revision);
       CREATE TABLE IF NOT EXISTS processed_actions (
-        action_id TEXT PRIMARY KEY, actor_user_id TEXT NOT NULL, result_json TEXT NOT NULL, processed_at INTEGER NOT NULL
+        action_id TEXT PRIMARY KEY, actor_user_id TEXT NOT NULL, revision INTEGER NOT NULL, processed_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS processed_webhooks (
         delivery_id TEXT PRIMARY KEY, processed_at INTEGER NOT NULL
       );
-      INSERT OR IGNORE INTO _sql_schema_migrations (id, applied_at) VALUES (1, unixepoch() * 1000);
     `);
-    const migration = this.ctx.storage.sql.exec<{ id: number }>("SELECT MAX(id) AS id FROM _sql_schema_migrations").one().id;
-    if (migration < 2) {
-      this.ctx.storage.transactionSync(() => {
-        this.ctx.storage.sql.exec("ALTER TABLE tasks ADD COLUMN resolution TEXT");
-        this.ctx.storage.sql.exec("ALTER TABLE tasks ADD COLUMN resolution_reason TEXT");
-        this.ctx.storage.sql.exec("ALTER TABLE tasks ADD COLUMN resolved_at INTEGER");
-        this.ctx.storage.sql.exec("UPDATE tasks SET resolution = 'completed', resolved_at = updated_at WHERE column_name = 'done'");
-        this.ctx.storage.sql.exec("INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (2, ?)", Date.now());
-      });
-    }
-    if (migration < 3) {
-      this.ctx.storage.transactionSync(() => {
-        this.ctx.storage.sql.exec("ALTER TABLE assignments ADD COLUMN focus TEXT NOT NULL DEFAULT 'implementation'");
-        this.ctx.storage.sql.exec("UPDATE assignments SET focus = 'planning' WHERE kind = 'planning'");
-        this.ctx.storage.sql.exec("INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (3, ?)", Date.now());
-      });
-    }
-    if (migration < 4) {
-      this.ctx.storage.transactionSync(() => {
-        this.ctx.storage.sql.exec("ALTER TABLE tasks ADD COLUMN task_reference TEXT");
-        const tasks = this.ctx.storage.sql.exec<{ id: string }>("SELECT id FROM tasks ORDER BY created_at ASC, id ASC").toArray();
-        for (const task of tasks) this.ctx.storage.sql.exec("UPDATE tasks SET task_reference = ? WHERE id = ?", this.allocateTaskReference(task.id), task.id);
-        this.ctx.storage.sql.exec("CREATE UNIQUE INDEX tasks_reference_idx ON tasks(task_reference)");
-        this.ctx.storage.sql.exec(`
-          CREATE TRIGGER tasks_reference_required BEFORE INSERT ON tasks
-          WHEN NEW.task_reference IS NULL OR NEW.task_reference = ''
-          BEGIN SELECT RAISE(ABORT, 'task_reference is required'); END;
-          CREATE TRIGGER tasks_reference_immutable BEFORE UPDATE OF task_reference ON tasks
-          WHEN OLD.task_reference IS NOT NEW.task_reference
-          BEGIN SELECT RAISE(ABORT, 'task_reference is immutable'); END;
-        `);
-        this.ctx.storage.sql.exec("INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (4, ?)", Date.now());
-      });
-    }
-    if (migration < 5) {
-      this.ctx.storage.transactionSync(() => {
-        this.ctx.storage.sql.exec("ALTER TABLE board_metadata ADD COLUMN repository_id INTEGER NOT NULL DEFAULT 0");
-        this.ctx.storage.sql.exec("ALTER TABLE board_metadata ADD COLUMN installation_id INTEGER NOT NULL DEFAULT 0");
-        this.ctx.storage.sql.exec("ALTER TABLE pr_snapshots ADD COLUMN refresh_generation INTEGER NOT NULL DEFAULT 0");
-        this.ctx.storage.sql.exec("ALTER TABLE pr_snapshots ADD COLUMN applied_generation INTEGER NOT NULL DEFAULT 0");
-        this.ctx.storage.sql.exec("ALTER TABLE pr_snapshots ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0");
-        this.ctx.storage.sql.exec("INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (5, ?)", Date.now());
-      });
-    }
   }
 
   private getMetadata(): BoardMetadata | null {
@@ -866,7 +819,7 @@ export class RepoBoard extends DurableObject<Env> {
         .map((row) => ({ revision: row.revision, title: row.title, description: row.description, authorUserId: row.author_user_id, authorLogin: row.author_login, createdAt: row.created_at } satisfies TaskRevision)),
       plan: planRow ? { revision: planRow.revision, markdown: planRow.markdown, authorUserId: planRow.author_user_id, authorLogin: planRow.author_login, createdAt: planRow.created_at, delegatedApproval: true } satisfies PlanRevision : null,
       assignment: assignment ? assignmentView(assignment, viewer.userId) : null,
-      pullRequest: prRow ? storedPullRequest(prRow.snapshot_json) : null,
+      pullRequest: prRow ? JSON.parse(prRow.snapshot_json) as PullRequestSnapshot : null,
       recentEvents: this.ctx.storage.sql.exec<{ id: number; revision: number; event_type: string; task_id: string | null; actor_login: string | null; occurred_at: number; data_json: string }>("SELECT * FROM events WHERE task_id = ? ORDER BY id DESC LIMIT 20", task.id).toArray().map(eventView),
     };
   }
@@ -909,6 +862,15 @@ export class RepoBoard extends DurableObject<Env> {
   }
 }
 
+export function boardIdentityMatches(
+  current: Pick<BoardMetadata, "fullName" | "repositoryId" | "installationId">,
+  next: Pick<BoardMetadata, "fullName" | "repositoryId" | "installationId">,
+): boolean {
+  return current.fullName.toLowerCase() === next.fullName.toLowerCase()
+    && current.repositoryId === next.repositoryId
+    && current.installationId === next.installationId;
+}
+
 class BoardError extends Error {
   constructor(
     public readonly code: string,
@@ -937,25 +899,6 @@ function failure<T>(
 
 function parseStats(value: string): AgentStats {
   return JSON.parse(value) as AgentStats;
-}
-
-function storedPullRequest(value: string): PullRequestSnapshot {
-  const snapshot = JSON.parse(value) as PullRequestSnapshot;
-  return {
-    ...snapshot,
-    authorLogin: snapshot.authorLogin ?? "",
-    baseRef: snapshot.baseRef ?? "",
-    requestedReviewers: snapshot.requestedReviewers ?? [],
-    latestReviews: snapshot.latestReviews ?? [],
-    recentReviews: (snapshot.recentReviews ?? []).map((review) => ({ ...review, commitSha: review.commitSha ?? null })),
-    reviewRequirement: snapshot.reviewRequirement ?? {
-      requiredApprovals: null,
-      decision: null,
-      codeOwnerReviewRequired: null,
-      latestPushApprovalRequired: null,
-    },
-    mergeState: snapshot.mergeState ?? null,
-  };
 }
 
 function assignmentView(row: AssignmentRow, viewerUserId: string | null): AssignmentView {

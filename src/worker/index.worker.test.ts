@@ -31,6 +31,11 @@ function authenticated(role: string, userId = "user-zac", login = "zac", init: R
 }
 
 describe("Worker authorization and directory routing", () => {
+  it("uses the prelaunch D1 schema without the removed permission cache", async () => {
+    const table = await env.DIRECTORY.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'permission_cache'").first<{ name: string }>();
+    expect(table).toBeNull();
+  });
+
   it("shows an unpersisted blank board for any public repository route", async () => {
     const response = await SELF.fetch("https://example.com/api/boards/acme/new-public", { headers: { "x-test-repository-visibility": "public" } });
     expect(response.status).toBe(200);

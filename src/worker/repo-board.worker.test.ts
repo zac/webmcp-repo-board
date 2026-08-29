@@ -1,7 +1,7 @@
 import { env, evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { Actor, BoardView, CommandEnvelope, InternalBoardCommand, PullRequestSnapshot, RpcResult, Viewer } from "../shared";
-import type { RepoBoard } from "./repo-board";
+import { boardIdentityMatches, type RepoBoard } from "./repo-board";
 
 const zac: Actor = { userId: "user-zac", login: "zac" };
 const ada: Actor = { userId: "user-ada", login: "ada" };
@@ -72,6 +72,24 @@ function unwrap<T>(result: RpcResult<T>): T {
 }
 
 describe("RepoBoard Durable Object", () => {
+  it("boots one strict canonical schema and rejects identity changes", async () => {
+    const stub = await freshBoard("canonical-schema");
+    await runInDurableObject(stub, async (_instance, state) => {
+      const tables = state.storage.sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table'").toArray().map((row) => row.name);
+      expect(tables).not.toContain("_sql_schema_migrations");
+      const actionColumns = state.storage.sql.exec<{ name: string }>("PRAGMA table_info(processed_actions)").toArray().map((row) => row.name);
+      expect(actionColumns).toEqual(["action_id", "actor_user_id", "revision", "processed_at"]);
+    });
+    expect(boardIdentityMatches(
+      { fullName: "acme/widgets", repositoryId: 1, installationId: 1 },
+      { fullName: "ACME/widgets", repositoryId: 1, installationId: 1 },
+    )).toBe(true);
+    expect(boardIdentityMatches(
+      { fullName: "acme/widgets", repositoryId: 1, installationId: 1 },
+      { fullName: "acme/widgets", repositoryId: 2, installationId: 1 },
+    )).toBe(false);
+  });
+
   it("allocates unique immutable word pairs inside one repository board", async () => {
     const stub = await freshBoard("task-references");
     let revision = 0;
@@ -132,10 +150,11 @@ describe("RepoBoard Durable Object", () => {
     view = unwrap(await command(stub, ada, 7, { type: "link_pull_request_snapshot", assignmentId: implementationId, snapshot: pullRequest() }));
     expect(view.tasks[0]).toMatchObject({ column: "in_pr", pullRequest: { number: 23 } });
     const newestSync = Date.now() + 10_000;
-    unwrap(await stub.applyPullRequest(pullRequest({ approvals: 2, syncedAt: newestSync }), "manual", Date.now()));
-    expect(unwrap(await stub.applyPullRequest(pullRequest({ state: "closed", merged: true, syncedAt: 1 }), "delayed-webhook", Date.now()))).toBeNull();
+    const approvalRefresh = unwrap(await stub.reservePullRequestRefresh(taskId));
+    unwrap(await stub.applyPullRequest(pullRequest({ approvals: 2, syncedAt: newestSync }), "manual", Date.now(), approvalRefresh.generation));
     expect(unwrap(await stub.getView(viewer(ada), false)).tasks[0].column).toBe("in_pr");
-    const merged = await stub.applyPullRequest(pullRequest({ state: "closed", merged: true, approvals: 2, syncedAt: newestSync + 1 }), "webhook", Date.now());
+    const mergeRefresh = unwrap(await stub.reservePullRequestRefresh(taskId));
+    const merged = await stub.applyPullRequest(pullRequest({ state: "closed", merged: true, approvals: 2, syncedAt: newestSync + 1 }), "webhook", Date.now(), mergeRefresh.generation);
     expect(unwrap(merged)?.tasks[0]).toMatchObject({ column: "done", resolution: "completed", resolutionReason: null, assignment: null });
     view = unwrap(await command(stub, zac, 10, { type: "archive_task", taskId }));
     expect(view.tasks).toHaveLength(0);
@@ -284,7 +303,8 @@ describe("RepoBoard Durable Object", () => {
     const cannotCancel = await command(stub, zac, 6, { type: "cancel_task", taskId, reason: "No longer needed" });
     expect(cannotCancel.ok).toBe(false);
     if (!cannotCancel.ok) expect(cannotCancel.error).toMatchObject({ code: "task_not_cancelable" });
-    const closed = unwrap(await stub.applyPullRequest(pullRequest({ state: "closed" }), "webhook", Date.now()));
+    const refresh = unwrap(await stub.reservePullRequestRefresh(taskId));
+    const closed = unwrap(await stub.applyPullRequest(pullRequest({ state: "closed" }), "webhook", Date.now(), refresh.generation));
     expect(closed?.tasks[0].column).toBe("in_progress");
   });
 
@@ -297,8 +317,8 @@ describe("RepoBoard Durable Object", () => {
     const view = unwrap(first);
     expect(view.tasks).toHaveLength(1);
     await runInDurableObject(stub, async (_instance, state) => {
-      const receipt = state.storage.sql.exec<{ result_json: string }>("SELECT result_json FROM processed_actions WHERE action_id = ?", actionId).one();
-      expect(receipt.result_json).toBe('{"revision":1}');
+      const receipt = state.storage.sql.exec<{ revision: number }>("SELECT revision FROM processed_actions WHERE action_id = ?", actionId).one();
+      expect(receipt.revision).toBe(1);
     });
 
     const stale = await command(stub, zac, 0, { type: "edit_task", taskId: view.tasks[0].id, title: "Stale", description: "No" });

@@ -38,11 +38,3 @@ CREATE TABLE IF NOT EXISTS boards (
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS boards_installation_idx ON boards(installation_id);
-
-CREATE TABLE IF NOT EXISTS permission_cache (
-  user_id TEXT NOT NULL,
-  board_id TEXT NOT NULL,
-  role_name TEXT NOT NULL,
-  checked_at INTEGER NOT NULL,
-  PRIMARY KEY (user_id, board_id)
-);
