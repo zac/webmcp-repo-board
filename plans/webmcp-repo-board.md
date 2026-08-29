@@ -18,8 +18,8 @@ Every GitHub repository has a stable entry route at `/boards/:owner/:repo`. A pu
 
 - The UI is kanban-style, but arbitrary dragging is disabled. State changes must satisfy workflow rules.
 - Humans can enter any `owner/repo` from the landing page or navigate directly to `/boards/:owner/:repo`; an explicit board-creation flow is not required.
-- Humans create and edit Todo tickets in the UI. Each ticket has a title, Markdown description, revision history, activity log, and optional linked PR.
-- “Plan with Codex” copies a prompt containing the board URL and ticket ID. “Implement with Codex” does the same for Ready or stale work.
+- Humans create and edit Todo tickets in the UI. Each ticket has an immutable repository-local two-word reference, a title, Markdown description, revision history, activity log, and optional linked PR. UUIDs remain internal storage keys.
+- “Plan with Codex” copies a prompt containing the board URL and ticket reference. “Implement with Codex” does the same for Ready or stale work.
 - Copying does not reserve the ticket. The first authorized agent to call `claim_task` receives the assignment. A simultaneous caller gets a structured conflict with the current owner and lease expiry.
 - Planning is delegated approval: the human’s choice to start a planning task authorizes its agent to call `set_plan`. Submission creates an immutable plan revision, moves Todo to Ready, and closes the planning assignment.
 - A Ready assignment remains in Ready while the agent reads or updates the plan. `update_plan` creates another delegated-approved revision. `start_work` moves it to In Progress.
@@ -33,7 +33,7 @@ Assignments use renewable 15-minute leases. Assignment tool calls renew the leas
 ### Storage and real-time state
 
 - One SQLite-backed `RepoBoard` Durable Object per `owner/repo`.
-- Its SQLite database owns tasks, plan revisions, assignments, progress reports, PR snapshots, processed actions, processed webhook deliveries, and the append-only board event log.
+- Its SQLite database owns tasks and their unique two-word references, plan revisions, assignments, progress reports, PR snapshots, processed actions, processed webhook deliveries, and the append-only board event log.
 - D1 stores only global data: GitHub identities, hashed web sessions, installations, and the `owner/repo → boardId` directory for materialized boards. Public previews are cached briefly at the edge and do not create database state.
 - Accepted commands update Durable Object SQLite atomically, increment the board revision, and then broadcast a revisioned update through hibernating WebSockets.
 - Reconnecting clients send their last revision and receive either missed events or a full snapshot.
@@ -103,7 +103,7 @@ A normalized PR snapshot contains PR number, URL, draft/open/closed/merged state
 - Reducer tests cover every legal transition and reject skipped columns, wrong assignment kinds, stale revisions, cross-repository PRs, closed PR linking, and invalid archival.
 - Concurrency tests issue simultaneous claims and prove exactly one succeeds. Cover duplicate actions, expiry, takeover, stale-agent mutations, release, and planner completion.
 - Authorization tests cover anonymous public reads, stateless public previews, indistinguishable private/missing routes, lazy materialization, each GitHub role including `triage` via `role_name`, session isolation, revoked access, CSRF state, safe OAuth return paths, and two tabs of one session holding different assignments without interference.
-- WebMCP tests assert the exact registry for every context, profile cleanup, duplicate-name prevention, bounded schemas/results, cancellation, confirmation, and UI/tool parity.
+- WebMCP tests assert the exact registry for every context, two-word reference lookup, profile cleanup, duplicate-name prevention, bounded schemas/results, cancellation, confirmation, and UI/tool parity.
 - GitHub tests verify webhook signatures and deduplication, review/check normalization, delayed-event ordering, manual refresh, merge-to-Done, and closed-unmerged rollback.
 - Worker tests cover Durable Object eviction, persistence, WebSocket replay/resynchronization, alarm-driven lease expiry, and D1 board lookup.
 - Browser acceptance demonstrates two agents racing for one task, a planning handoff, dynamic tool replacement, Ready-to-work transition, live progress, PR linkage, review changes, checks, merge, and archival.

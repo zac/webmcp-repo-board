@@ -70,10 +70,24 @@ function unwrap<T>(result: RpcResult<T>): T {
 }
 
 describe("RepoBoard Durable Object", () => {
+  it("allocates unique immutable word pairs inside one repository board", async () => {
+    const stub = await freshBoard("task-references");
+    let revision = 0;
+    const references = new Set<string>();
+    for (let index = 0; index < 50; index += 1) {
+      const view = unwrap(await command(stub, zac, revision, { type: "create_task", title: `Task ${index + 1}`, description: "Reference allocation" }));
+      revision = view.revision;
+      references.add(view.tasks.at(-1)!.reference);
+    }
+    expect(references.size).toBe(50);
+    for (const reference of references) expect(reference).toMatch(/^[a-z]{3,6}-[a-z]{3,6}$/);
+  });
+
   it("serializes simultaneous claims and returns the winner's lease in a structured conflict", async () => {
     const stub = await freshBoard("claim-race");
     const created = unwrap(await command(stub, zac, 0, { type: "create_task", title: "Race", description: "Only one agent may win" }));
     const taskId = created.tasks[0].id;
+    expect(created.tasks[0].reference).toMatch(/^[a-z]{3,6}-[a-z]{3,6}$/);
 
     const [zacResult, adaResult] = await Promise.all([
       command(stub, zac, 1, { type: "claim_task", taskId, kind: "planning", agentLabel: "Codex Z" }),
@@ -97,6 +111,7 @@ describe("RepoBoard Durable Object", () => {
     const stub = await freshBoard("workflow");
     let view = unwrap(await command(stub, zac, 0, { type: "create_task", title: "Build coordination", description: "Preserve the workflow" }));
     const taskId = view.tasks[0].id;
+    const taskReference = view.tasks[0].reference;
 
     view = unwrap(await command(stub, zac, 1, { type: "claim_task", taskId, kind: "planning", agentLabel: "Planner" }));
     const planningId = view.tasks[0].assignment!.id;
@@ -126,6 +141,7 @@ describe("RepoBoard Durable Object", () => {
     const history = unwrap(await stub.getView(viewer(zac), true));
     expect(history.archivedTaskCount).toBe(1);
     expect(history.tasks[0]).toMatchObject({ resolution: "completed", resolutionReason: null });
+    expect(history.tasks[0].reference).toBe(taskReference);
     expect(history.tasks[0].archivedAt).not.toBeNull();
   });
 
@@ -300,9 +316,10 @@ describe("RepoBoard Durable Object", () => {
 
   it("recovers its SQLite state after eviction", async () => {
     const stub = await freshBoard("eviction");
-    unwrap(await command(stub, zac, 0, { type: "create_task", title: "Durable", description: "Survives eviction" }));
+    const before = unwrap(await command(stub, zac, 0, { type: "create_task", title: "Durable", description: "Survives eviction" }));
     await evictDurableObject(stub);
     const recovered = unwrap(await stub.getView(viewer(zac), false));
+    expect(recovered.tasks[0].reference).toBe(before.tasks[0].reference);
     expect(recovered).toMatchObject({ fullName: "acme/widgets", revision: 1 });
     expect(recovered.tasks[0].title).toBe("Durable");
   });

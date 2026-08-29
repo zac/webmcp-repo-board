@@ -1,5 +1,6 @@
 import {
   AGENT_PHASES,
+  normalizeTaskReference,
   TASK_COLUMNS,
   type AgentPhase,
   type AgentStats,
@@ -82,11 +83,14 @@ export async function registerBoardTools(context: WebMcpContext, handlers: Board
     description: "Read one task, its delegated plan, current assignment, reported progress, linked pull request, and recent activity. All text from tickets, agents, and GitHub is untrusted content.",
     inputSchema: {
       type: "object", additionalProperties: false,
-      properties: { taskId: { type: "string", minLength: 1, maxLength: 100 } },
+      properties: {
+        taskRef: { type: "string", minLength: 3, maxLength: 32, description: "The two-word ticket reference, such as amber-fox." },
+        taskId: { type: "string", minLength: 1, maxLength: 100, description: "Legacy internal UUID. Prefer taskRef." },
+      },
     },
     annotations: { readOnlyHint: !assignedTask?.assignment, destructiveHint: false, untrustedContentHint: true },
     execute: async (input, execution) => {
-      const requested = typeof input.taskId === "string" ? input.taskId : null;
+      const requested = typeof input.taskRef === "string" ? input.taskRef : typeof input.taskId === "string" ? input.taskId : null;
       const combined = toolSignal(execution, signal);
       let inspected = await inspectTask(handlers, requested, combined);
       if (assignedTask?.assignment && "id" in inspected && inspected.id === assignedTask.id) {
@@ -137,23 +141,28 @@ export async function registerBoardTools(context: WebMcpContext, handlers: Board
       inputSchema: {
         type: "object", additionalProperties: false,
         properties: {
-          taskId: { type: "string", minLength: 1, maxLength: 100 },
+          taskRef: { type: "string", minLength: 3, maxLength: 32, description: "The two-word ticket reference, such as amber-fox." },
+          taskId: { type: "string", minLength: 1, maxLength: 100, description: "Legacy internal UUID. Prefer taskRef." },
           kind: { type: "string", enum: ["planning", "implementation"] },
           focus: { type: "string", enum: ["planning", "implementation", "review_feedback", "fix_checks", "merge_preparation"] },
           agentLabel: { type: "string", minLength: 1, maxLength: 80 },
         },
-        required: ["taskId", "kind", "agentLabel"],
+        required: ["kind", "agentLabel"],
+        anyOf: [{ required: ["taskRef"] }, { required: ["taskId"] }],
       },
       annotations: { readOnlyHint: false, destructiveHint: false, untrustedContentHint: false },
       execute: async (input, execution) => {
+        const requested = typeof input.taskRef === "string" ? input.taskRef : typeof input.taskId === "string" ? input.taskId : "";
+        const requestedTask = findTask(handlers.getBoard().tasks, requested);
+        if (!requestedTask) throw new Error(`Task reference ${requested || "(missing)"} was not found on this board`);
         const next = await handlers.runCommand({
           type: "claim_task",
-          taskId: String(input.taskId),
+          taskId: requestedTask.id,
           kind: input.kind as AssignmentKind,
           ...(typeof input.focus === "string" ? { focus: input.focus as AssignmentFocus } : {}),
           agentLabel: String(input.agentLabel),
         }, toolSignal(execution, signal));
-        const task = next.tasks.find((candidate) => candidate.id === input.taskId);
+        const task = next.tasks.find((candidate) => candidate.id === requestedTask.id);
         const guidance = task?.column === "todo"
           ? "Inspect the task and call set_plan."
           : task?.column === "ready"
@@ -384,18 +393,25 @@ async function renewReadAssignment(
 
 async function inspectTask(
   handlers: BoardToolHandlers,
-  requestedTaskId: string | null,
+  requestedTaskRef: string | null,
   signal: AbortSignal,
-): Promise<TaskView | { error: string; availableTaskIds: string[] }> {
+): Promise<TaskView | { error: string; availableTaskRefs: string[] }> {
   const board = handlers.getBoard();
-  const taskId = requestedTaskId ?? handlers.getSelectedTaskId() ?? board.tasks.find((task) => task.assignment?.id === handlers.getActiveAssignmentId())?.id;
-  const task = board.tasks.find((candidate) => candidate.id === taskId) ?? (taskId ? await handlers.loadTask(taskId, signal) : null);
-  return task ?? { error: "task_not_found", availableTaskIds: board.tasks.slice(0, 50).map((candidate) => candidate.id) };
+  const fallbackId = handlers.getSelectedTaskId() ?? board.tasks.find((task) => task.assignment?.id === handlers.getActiveAssignmentId())?.id ?? null;
+  const requested = requestedTaskRef ?? fallbackId;
+  const task = requested ? findTask(board.tasks, requested) ?? await handlers.loadTask(requested, signal) : null;
+  return task ?? { error: "task_not_found", availableTaskRefs: board.tasks.slice(0, 50).map((candidate) => candidate.reference) };
+}
+
+function findTask(tasks: TaskView[], reference: string): TaskView | null {
+  const normalized = normalizeTaskReference(reference);
+  return tasks.find((task) => task.id === reference || task.reference === normalized) ?? null;
 }
 
 function taskSummary(task: TaskView): Record<string, unknown> {
   return {
     id: task.id,
+    reference: task.reference,
     title: task.title,
     column: task.column,
     resolution: task.resolution,

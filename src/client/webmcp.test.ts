@@ -39,8 +39,10 @@ function pullRequest(): PullRequestSnapshot {
 
 function task(column: TaskColumn, assigned = false): TaskView {
   const kind: AssignmentKind = column === "todo" ? "planning" : "implementation";
+  const reference = ({ todo: "quiet-pine", ready: "amber-fox", in_progress: "swift-moss", in_pr: "lucid-rook", done: "coral-wren" } as const)[column];
   return {
     id: `task-${column}`,
+    reference,
     title: `${column} task`,
     description: "Untrusted ticket text",
     column,
@@ -96,7 +98,7 @@ function handlers(boardValue: BoardView, selected = boardValue.tasks[0]?.id ?? n
     getBoard: () => boardValue,
     getSelectedTaskId: () => selected,
     getActiveAssignmentId: () => boardValue.tasks[0]?.assignment?.id ?? null,
-    loadTask: vi.fn(async (taskId) => boardValue.tasks.find((taskValue) => taskValue.id === taskId) ?? null),
+    loadTask: vi.fn(async (taskRef) => boardValue.tasks.find((taskValue) => taskValue.id === taskRef || taskValue.reference === taskRef) ?? null),
     runCommand: vi.fn(async () => boardValue),
     refreshPullRequest: vi.fn(async () => boardValue),
     confirmArchive: vi.fn(async () => undefined),
@@ -200,7 +202,7 @@ describe("dynamic WebMCP profiles", () => {
     await registerBoardTools(registry, toolHandlers, controller.signal);
     const claim = registry.tools.get("claim_task")!;
     const executionController = new AbortController();
-    await expect(claim.execute({ taskId: "task-todo", kind: "planning", agentLabel: "Codex" }, { signal: executionController.signal })).resolves.toContain('"status":"claimed"');
+    await expect(claim.execute({ taskRef: "quiet-pine", kind: "planning", agentLabel: "Codex" }, { signal: executionController.signal })).resolves.toContain('"status":"claimed"');
   });
 
   it("passes a specialized feedback focus into the atomic claim", async () => {
@@ -209,10 +211,24 @@ describe("dynamic WebMCP profiles", () => {
     const toolHandlers = handlers(boardValue);
     await registerBoardTools(registry, toolHandlers, new AbortController().signal);
 
-    await registry.tools.get("claim_task")!.execute({ taskId: "task-in_pr", kind: "implementation", focus: "review_feedback", agentLabel: "Feedback agent" });
+    await registry.tools.get("claim_task")!.execute({ taskRef: "lucid-rook", kind: "implementation", focus: "review_feedback", agentLabel: "Feedback agent" });
 
     expect(toolHandlers.runCommand).toHaveBeenCalledWith(
       { type: "claim_task", taskId: "task-in_pr", kind: "implementation", focus: "review_feedback", agentLabel: "Feedback agent" },
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("resolves a human-typed two-word reference before claiming", async () => {
+    const registry = new Registry();
+    const boardValue = board(task("ready"));
+    const toolHandlers = handlers(boardValue);
+    await registerBoardTools(registry, toolHandlers, new AbortController().signal);
+
+    await registry.tools.get("claim_task")!.execute({ taskRef: "Amber Fox", kind: "implementation", agentLabel: "Builder" });
+
+    expect(toolHandlers.runCommand).toHaveBeenCalledWith(
+      { type: "claim_task", taskId: "task-ready", kind: "implementation", agentLabel: "Builder" },
       expect.any(AbortSignal),
     );
   });
@@ -253,13 +269,13 @@ describe("dynamic WebMCP profiles", () => {
     const archivedTask = { ...task("done"), archivedAt: 100 };
     const liveBoard = { ...board(task("done")), tasks: [] };
     const toolHandlers = handlers(liveBoard, archivedTask.id);
-    toolHandlers.loadTask = vi.fn(async (taskId) => taskId === archivedTask.id ? archivedTask : null);
+    toolHandlers.loadTask = vi.fn(async (taskRef) => taskRef === archivedTask.id || taskRef === archivedTask.reference ? archivedTask : null);
     await registerBoardTools(registry, toolHandlers, new AbortController().signal);
 
-    const result = await registry.tools.get("inspect_task")!.execute({ taskId: archivedTask.id });
+    const result = await registry.tools.get("inspect_task")!.execute({ taskRef: archivedTask.reference });
 
     expect(result).toContain('"archivedAt":100');
-    expect(toolHandlers.loadTask).toHaveBeenCalledWith(archivedTask.id, expect.any(AbortSignal));
+    expect(toolHandlers.loadTask).toHaveBeenCalledWith(archivedTask.reference, expect.any(AbortSignal));
     expect(liveBoard.tasks).toEqual([]);
   });
 

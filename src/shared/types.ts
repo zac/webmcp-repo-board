@@ -126,6 +126,7 @@ export interface TaskEvent {
 
 export interface TaskView {
   id: string;
+  reference: string;
   title: string;
   description: string;
   column: TaskColumn;

@@ -5,6 +5,8 @@ import {
   canArchive,
   canCancel,
   columnForPullRequest,
+  taskReferenceCandidate,
+  TASK_REFERENCE_CAPACITY,
   type Actor,
   type AgentPhase,
   type AgentStats,
@@ -40,6 +42,7 @@ interface BoardMetadata {
 
 interface TaskRow extends Record<string, SqlStorageValue> {
   id: string;
+  task_reference: string;
   title: string;
   description: string;
   column_name: TaskColumn;
@@ -370,10 +373,12 @@ export class RepoBoard extends DurableObject<Env> {
         const count = this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM tasks WHERE archived_at IS NULL").one().count;
         if (count >= MAX_TASKS) throw new BoardError("task_limit", "Board already has the maximum number of active tasks", 409);
         const taskId = crypto.randomUUID();
+        const taskReference = this.allocateTaskReference(taskId);
         this.ctx.storage.sql.exec(
-          `INSERT INTO tasks (id, title, description, column_name, archived_at, created_by, created_at, updated_at, task_revision, latest_plan_revision, linked_pr_number)
-           VALUES (?, ?, ?, 'todo', NULL, ?, ?, ?, ?, 0, NULL)`,
+          `INSERT INTO tasks (id, task_reference, title, description, column_name, archived_at, created_by, created_at, updated_at, task_revision, latest_plan_revision, linked_pr_number)
+           VALUES (?, ?, ?, ?, 'todo', NULL, ?, ?, ?, ?, 0, NULL)`,
           taskId,
+          taskReference,
           command.title,
           command.description,
           actor.login,
@@ -382,7 +387,7 @@ export class RepoBoard extends DurableObject<Env> {
           revision,
         );
         this.insertTaskRevision(taskId, revision, command.title, command.description, actor, now);
-        return { type: "task_created", taskId, data: { title: command.title } };
+        return { type: "task_created", taskId, data: { title: command.title, reference: taskReference } };
       }
       case "edit_task": {
         const task = this.requireTask(command.taskId);
@@ -624,6 +629,23 @@ export class RepoBoard extends DurableObject<Env> {
         this.ctx.storage.sql.exec("INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (3, ?)", Date.now());
       });
     }
+    if (migration < 4) {
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec("ALTER TABLE tasks ADD COLUMN task_reference TEXT");
+        const tasks = this.ctx.storage.sql.exec<{ id: string }>("SELECT id FROM tasks ORDER BY created_at ASC, id ASC").toArray();
+        for (const task of tasks) this.ctx.storage.sql.exec("UPDATE tasks SET task_reference = ? WHERE id = ?", this.allocateTaskReference(task.id), task.id);
+        this.ctx.storage.sql.exec("CREATE UNIQUE INDEX tasks_reference_idx ON tasks(task_reference)");
+        this.ctx.storage.sql.exec(`
+          CREATE TRIGGER tasks_reference_required BEFORE INSERT ON tasks
+          WHEN NEW.task_reference IS NULL OR NEW.task_reference = ''
+          BEGIN SELECT RAISE(ABORT, 'task_reference is required'); END;
+          CREATE TRIGGER tasks_reference_immutable BEFORE UPDATE OF task_reference ON tasks
+          WHEN OLD.task_reference IS NOT NEW.task_reference
+          BEGIN SELECT RAISE(ABORT, 'task_reference is immutable'); END;
+        `);
+        this.ctx.storage.sql.exec("INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (4, ?)", Date.now());
+      });
+    }
   }
 
   private getMetadata(): BoardMetadata | null {
@@ -639,6 +661,15 @@ export class RepoBoard extends DurableObject<Env> {
     const task = this.ctx.storage.sql.exec<TaskRow>("SELECT * FROM tasks WHERE id = ?", taskId).toArray()[0];
     if (!task) throw new BoardError("task_not_found", "Task was not found", 404);
     return task;
+  }
+
+  private allocateTaskReference(taskId: string): string {
+    for (let attempt = 0; attempt < TASK_REFERENCE_CAPACITY; attempt += 1) {
+      const candidate = taskReferenceCandidate(taskId, attempt);
+      const existing = this.ctx.storage.sql.exec<{ id: string }>("SELECT id FROM tasks WHERE task_reference = ?", candidate).toArray()[0];
+      if (!existing) return candidate;
+    }
+    throw new BoardError("task_reference_exhausted", "This board has no remaining task references", 409);
   }
 
   private activeAssignment(taskId: string, now: number): AssignmentRow | null {
@@ -726,6 +757,7 @@ export class RepoBoard extends DurableObject<Env> {
     const prRow = this.ctx.storage.sql.exec<{ snapshot_json: string }>("SELECT snapshot_json FROM pr_snapshots WHERE task_id = ?", task.id).toArray()[0];
     return {
       id: task.id,
+      reference: task.task_reference,
       title: task.title,
       description: task.description,
       column: task.column_name,

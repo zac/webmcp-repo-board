@@ -93,7 +93,7 @@ Any public GitHub repository route is anonymously readable. If no board exists, 
 
 The page always exposes `list_tasks` and `inspect_task`. An authorized unassigned page also exposes `claim_task`. Once the current tab pins an assignment, the registry switches to the tools legal for that ticket state. General read tools are reused; there is intentionally no parallel `read_task` tool.
 
-“Copy planning prompt” and “Copy implementation prompt” include the board URL and ticket ID, but do not reserve work. The first valid `claim_task` wins. Assigned tool calls renew the lease; an idle browser tab does not.
+Every ticket has an immutable two-word reference such as `amber-fox`. The UUID remains an internal storage key. “Copy planning prompt” and “Copy implementation prompt” include the board URL and ticket reference, but do not reserve work. The first valid `claim_task` wins. Assigned tool calls renew the lease; an idle browser tab does not.
 
 Ticket, plan, progress, review, and GitHub content is untrusted data. It is bounded in schemas and results and cannot select tools, authorize a mutation, choose a repository, or provide secrets.
 
