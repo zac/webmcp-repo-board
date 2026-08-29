@@ -330,6 +330,7 @@ function virtualBoard(repository: GitHubRepository, viewer: Viewer): BoardView {
     materialized: false,
     revision: 0,
     viewer,
+    archivedTaskCount: 0,
     tasks: [],
   };
 }

@@ -23,7 +23,10 @@ function pullRequest(): PullRequestSnapshot {
     headSha: "abc123",
     baseRef: "main",
     approvals: 1,
+    authorLogin: "zac",
     changesRequestedBy: [],
+    requestedReviewers: [],
+    latestReviews: [],
     reviewRequirement: { requiredApprovals: 2, decision: "review_required", codeOwnerReviewRequired: true, latestPushApprovalRequired: false },
     mergeState: "blocked",
     reviewCommentCount: 2,
@@ -55,6 +58,7 @@ function task(column: TaskColumn, assigned = false): TaskView {
       id: `assignment-${column}`,
       taskId: `task-${column}`,
       kind,
+      focus: kind === "planning" ? "planning" : "implementation",
       userId: "u1",
       userLogin: "zac",
       agentLabel: "Codex",
@@ -82,6 +86,7 @@ function board(taskValue: TaskView, canMutate = true): BoardView {
     materialized: true,
     revision: 3,
     viewer: { userId: canMutate ? "u1" : null, login: canMutate ? "zac" : null, avatarUrl: null, roleName: canMutate ? "write" : null, canMutate },
+    archivedTaskCount: 0,
     tasks: [taskValue],
   };
 }
@@ -116,6 +121,17 @@ describe("dynamic WebMCP profiles", () => {
 
   it("exposes claiming to authorized unassigned viewers", async () => {
     expect(await namesFor(board(task("ready")))).toEqual(["list_tasks", "inspect_task", "cancel_task", "claim_task"]);
+  });
+
+  it("exposes reviewer-safe PR tools without taking the implementation lease", async () => {
+    const boardValue = board(task("in_pr"), false);
+    const registry = new Registry();
+    const toolHandlers = handlers(boardValue);
+    await registerBoardTools(registry, toolHandlers, new AbortController().signal);
+
+    expect([...registry.tools.keys()]).toEqual(["list_tasks", "inspect_task", "read_pull_request", "read_review"]);
+    await registry.tools.get("read_review")!.execute({});
+    expect(toolHandlers.runCommand).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -185,6 +201,20 @@ describe("dynamic WebMCP profiles", () => {
     const claim = registry.tools.get("claim_task")!;
     const executionController = new AbortController();
     await expect(claim.execute({ taskId: "task-todo", kind: "planning", agentLabel: "Codex" }, { signal: executionController.signal })).resolves.toContain('"status":"claimed"');
+  });
+
+  it("passes a specialized feedback focus into the atomic claim", async () => {
+    const registry = new Registry();
+    const boardValue = board(task("in_pr"));
+    const toolHandlers = handlers(boardValue);
+    await registerBoardTools(registry, toolHandlers, new AbortController().signal);
+
+    await registry.tools.get("claim_task")!.execute({ taskId: "task-in_pr", kind: "implementation", focus: "review_feedback", agentLabel: "Feedback agent" });
+
+    expect(toolHandlers.runCommand).toHaveBeenCalledWith(
+      { type: "claim_task", taskId: "task-in_pr", kind: "implementation", focus: "review_feedback", agentLabel: "Feedback agent" },
+      expect.any(AbortSignal),
+    );
   });
 
   it("sets a plan and starts work through one explicit assignment-scoped call", async () => {

@@ -3,6 +3,7 @@ import {
   TASK_COLUMNS,
   type AgentPhase,
   type AgentStats,
+  type AssignmentFocus,
   type AssignmentKind,
   type BoardCommand,
   type BoardView,
@@ -122,23 +123,36 @@ export async function registerBoardTools(context: WebMcpContext, handlers: Board
     return names;
   }
 
+  if (selected?.column === "in_pr" && selected.pullRequest) {
+    await add(readPullRequestTool(selected, handlers, signal));
+    await add(readReviewTool(selected, handlers, signal));
+    if (board.viewer.canMutate) await add(checkStatusTool(selected, handlers, signal));
+  }
+
   if (board.viewer.canMutate) {
     await add({
       name: "claim_task",
       title: "Claim a repository task",
-      description: "Atomically claim a Todo task for planning, or a Ready, In Progress, or In PR task for implementation. The first valid claim wins a renewable 15-minute lease.",
+      description: "Atomically claim a Todo task for planning, or a Ready, In Progress, or In PR task for implementation. In PR work may identify review feedback, failing checks, or merge preparation as its focus. The first valid claim wins a renewable 15-minute task-wide write lease.",
       inputSchema: {
         type: "object", additionalProperties: false,
         properties: {
           taskId: { type: "string", minLength: 1, maxLength: 100 },
           kind: { type: "string", enum: ["planning", "implementation"] },
+          focus: { type: "string", enum: ["planning", "implementation", "review_feedback", "fix_checks", "merge_preparation"] },
           agentLabel: { type: "string", minLength: 1, maxLength: 80 },
         },
         required: ["taskId", "kind", "agentLabel"],
       },
       annotations: { readOnlyHint: false, destructiveHint: false, untrustedContentHint: false },
       execute: async (input, execution) => {
-        const next = await handlers.runCommand({ type: "claim_task", taskId: String(input.taskId), kind: input.kind as AssignmentKind, agentLabel: String(input.agentLabel) }, toolSignal(execution, signal));
+        const next = await handlers.runCommand({
+          type: "claim_task",
+          taskId: String(input.taskId),
+          kind: input.kind as AssignmentKind,
+          ...(typeof input.focus === "string" ? { focus: input.focus as AssignmentFocus } : {}),
+          agentLabel: String(input.agentLabel),
+        }, toolSignal(execution, signal));
         const task = next.tasks.find((candidate) => candidate.id === input.taskId);
         const guidance = task?.column === "todo"
           ? "Inspect the task and call set_plan."
@@ -146,7 +160,13 @@ export async function registerBoardTools(context: WebMcpContext, handlers: Board
             ? "Inspect the plan, update it if needed, then call start_work."
             : task?.column === "in_progress"
               ? "Continue implementation and call link_pull_request when its open PR exists."
-              : "Inspect the pull request, reviews, and checks, then continue follow-up.";
+              : input.focus === "review_feedback"
+                ? "Read the current review feedback, report progress, address it, test the changes, and release the assignment after updates are pushed."
+                : input.focus === "fix_checks"
+                  ? "Refresh the current checks, repair failures, report verification, and release the assignment after updates are pushed."
+                  : input.focus === "merge_preparation"
+                    ? "Refresh reviews and checks, perform final verification, and leave the human to merge through GitHub."
+                    : "Inspect the pull request, reviews, and checks, then continue follow-up.";
         return bounded({ status: "claimed", revision: next.revision, task: task ? taskSummary(task) : null, assignment: task?.assignment ?? null, next: guidance });
       },
     });
@@ -275,32 +295,9 @@ async function addAssignmentTools(
   }
 
   if (task.column === "in_pr" && assignment.kind === "implementation" && task.pullRequest) {
-    await add({ ...readPullRequestTool(task, handlers, registrySignal), name: "read_pull_request" });
-    await add({
-      name: "read_review",
-      title: "Read pull request reviews",
-      description: "Renew this assignment lease, then read bounded review decisions and recent review bodies. GitHub review text is untrusted content.",
-      inputSchema: emptySchema(),
-      annotations: { readOnlyHint: false, destructiveHint: false, untrustedContentHint: true },
-      execute: async (_input, execution) => {
-        await renewReadAssignment(handlers, assignmentId, execution, registrySignal);
-        const current = handlers.getBoard().tasks.find((candidate) => candidate.id === task.id) ?? task;
-        return bounded({ pullRequest: current.pullRequest!.number, approvals: current.pullRequest!.approvals, reviewRequirement: current.pullRequest!.reviewRequirement, mergeState: current.pullRequest!.mergeState, changesRequestedBy: current.pullRequest!.changesRequestedBy, reviewCommentCount: current.pullRequest!.reviewCommentCount, conversationCommentCount: current.pullRequest!.conversationCommentCount, recentReviews: current.pullRequest!.recentReviews });
-      },
-    });
-    await add({
-      name: "check_status",
-      title: "Refresh pull request status",
-      description: "Renew this assignment lease, fetch current review, comment, check, and merge state from GitHub, repair the cached snapshot, and return the updated status.",
-      inputSchema: emptySchema(),
-      annotations: { readOnlyHint: false, destructiveHint: false, untrustedContentHint: true },
-      execute: async (_input, execution) => {
-        const combined = toolSignal(execution, registrySignal);
-        await handlers.runCommand({ type: "renew_assignment", assignmentId }, combined);
-        const next = await handlers.refreshPullRequest(task.id, combined);
-        return bounded(next.tasks.find((candidate) => candidate.id === task.id)?.pullRequest ?? { status: "not_linked" });
-      },
-    });
+    await add(readPullRequestTool(task, handlers, registrySignal, assignmentId));
+    await add(readReviewTool(task, handlers, registrySignal, assignmentId));
+    await add(checkStatusTool(task, handlers, registrySignal, assignmentId));
   }
 }
 
@@ -318,16 +315,60 @@ function readPlanTool(task: TaskView, handlers: BoardToolHandlers, registrySigna
   };
 }
 
-function readPullRequestTool(task: TaskView, handlers: BoardToolHandlers, registrySignal: AbortSignal): WebMcpTool {
+function readPullRequestTool(task: TaskView, handlers: BoardToolHandlers, registrySignal: AbortSignal, assignmentId?: string): WebMcpTool {
   return {
     name: "read_pull_request",
     title: "Read the linked pull request",
-    description: "Renew this assignment lease, then read the cached linked pull request metadata and check summary. GitHub text is untrusted content.",
+    description: `${assignmentId ? "Renew this assignment lease, then read" : "Read"} the cached linked pull request metadata and check summary. GitHub text is untrusted content.`,
+    inputSchema: emptySchema(),
+    annotations: { readOnlyHint: !assignmentId, destructiveHint: false, untrustedContentHint: true },
+    execute: async (_input, execution) => {
+      if (assignmentId) await renewReadAssignment(handlers, assignmentId, execution, registrySignal);
+      return bounded(handlers.getBoard().tasks.find((candidate) => candidate.id === task.id)?.pullRequest ?? task.pullRequest ?? { status: "not_linked" });
+    },
+  };
+}
+
+function readReviewTool(task: TaskView, handlers: BoardToolHandlers, registrySignal: AbortSignal, assignmentId?: string): WebMcpTool {
+  return {
+    name: "read_review",
+    title: "Read pull request reviews",
+    description: `${assignmentId ? "Renew this assignment lease, then read" : "Read"} bounded review decisions and recent review bodies. GitHub review text is untrusted content.`,
+    inputSchema: emptySchema(),
+    annotations: { readOnlyHint: !assignmentId, destructiveHint: false, untrustedContentHint: true },
+    execute: async (_input, execution) => {
+      if (assignmentId) await renewReadAssignment(handlers, assignmentId, execution, registrySignal);
+      const current = handlers.getBoard().tasks.find((candidate) => candidate.id === task.id) ?? task;
+      const pullRequest = current.pullRequest!;
+      return bounded({
+        pullRequest: pullRequest.number,
+        authorLogin: pullRequest.authorLogin,
+        approvals: pullRequest.approvals,
+        reviewRequirement: pullRequest.reviewRequirement,
+        mergeState: pullRequest.mergeState,
+        changesRequestedBy: pullRequest.changesRequestedBy,
+        requestedReviewers: pullRequest.requestedReviewers,
+        latestReviews: pullRequest.latestReviews,
+        reviewCommentCount: pullRequest.reviewCommentCount,
+        conversationCommentCount: pullRequest.conversationCommentCount,
+        recentReviews: pullRequest.recentReviews,
+      });
+    },
+  };
+}
+
+function checkStatusTool(task: TaskView, handlers: BoardToolHandlers, registrySignal: AbortSignal, assignmentId?: string): WebMcpTool {
+  return {
+    name: "check_status",
+    title: "Refresh pull request status",
+    description: `${assignmentId ? "Renew this assignment lease, then fetch" : "Fetch"} current review, comment, check, and merge state from GitHub and repair the cached snapshot.`,
     inputSchema: emptySchema(),
     annotations: { readOnlyHint: false, destructiveHint: false, untrustedContentHint: true },
     execute: async (_input, execution) => {
-      await renewReadAssignment(handlers, task.assignment!.id, execution, registrySignal);
-      return bounded(handlers.getBoard().tasks.find((candidate) => candidate.id === task.id)?.pullRequest ?? task.pullRequest ?? { status: "not_linked" });
+      const combined = toolSignal(execution, registrySignal);
+      if (assignmentId) await handlers.runCommand({ type: "renew_assignment", assignmentId }, combined);
+      const next = await handlers.refreshPullRequest(task.id, combined);
+      return bounded(next.tasks.find((candidate) => candidate.id === task.id)?.pullRequest ?? { status: "not_linked" });
     },
   };
 }
@@ -361,8 +402,8 @@ function taskSummary(task: TaskView): Record<string, unknown> {
     resolutionReason: task.resolutionReason,
     archivedAt: task.archivedAt,
     planRevision: task.plan?.revision ?? null,
-    assignment: task.assignment ? { user: task.assignment.userLogin, agentLabel: task.assignment.agentLabel, phase: task.assignment.phase, summary: task.assignment.summary, leaseExpiresAt: task.assignment.leaseExpiresAt } : null,
-    pullRequest: task.pullRequest ? { number: task.pullRequest.number, state: task.pullRequest.state, merged: task.pullRequest.merged, approvals: task.pullRequest.approvals, reviewRequirement: task.pullRequest.reviewRequirement, mergeState: task.pullRequest.mergeState, changesRequested: task.pullRequest.changesRequestedBy.length, checks: task.pullRequest.checks } : null,
+    assignment: task.assignment ? { user: task.assignment.userLogin, agentLabel: task.assignment.agentLabel, focus: task.assignment.focus, phase: task.assignment.phase, summary: task.assignment.summary, leaseExpiresAt: task.assignment.leaseExpiresAt } : null,
+    pullRequest: task.pullRequest ? { number: task.pullRequest.number, authorLogin: task.pullRequest.authorLogin, state: task.pullRequest.state, merged: task.pullRequest.merged, approvals: task.pullRequest.approvals, reviewRequirement: task.pullRequest.reviewRequirement, mergeState: task.pullRequest.mergeState, changesRequested: task.pullRequest.changesRequestedBy.length, requestedReviewers: task.pullRequest.requestedReviewers, checks: task.pullRequest.checks } : null,
   };
 }
 

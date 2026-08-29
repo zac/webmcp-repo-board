@@ -1,4 +1,4 @@
-import type { PullRequestSnapshot, ReviewDetail } from "../shared";
+import type { LatestReview, PullRequestSnapshot, ReviewDetail } from "../shared";
 import type { GitHubUserIdentity } from "./auth";
 
 const API = "https://api.github.com";
@@ -103,8 +103,13 @@ export async function fetchPullRequestSnapshot(owner: string, repo: string, numb
   const pull = recordValue(await githubJson(`${base}/pulls/${number}`, token));
   const head = recordField(pull, "head");
   const pullBase = recordField(pull, "base");
+  const author = recordField(pull, "user");
   const headSha = stringField(head, "sha");
   const baseRef = stringField(pullBase, "ref");
+  const requestedReviewers = (Array.isArray(pull.requested_reviewers) ? pull.requested_reviewers : [])
+    .map(recordValue)
+    .map((reviewer) => stringField(reviewer, "login"))
+    .sort((left, right) => left.localeCompare(right));
   const [reviewsValue, reviewCommentsValue, conversationCommentsValue, checksValue, statusesValue, reviewState, rules] = await Promise.all([
     githubJson(`${base}/pulls/${number}/reviews?per_page=100`, token),
     githubJson(`${base}/pulls/${number}/comments?per_page=100`, token),
@@ -126,6 +131,12 @@ export async function fetchPullRequestSnapshot(owner: string, repo: string, numb
   const latest = [...latestByReviewer.entries()];
   const approvals = latest.filter(([, review]) => optionalString(review, "state") === "APPROVED").length;
   const changesRequestedBy = latest.filter(([, review]) => optionalString(review, "state") === "CHANGES_REQUESTED").map(([login]) => login).sort();
+  const latestReviews: LatestReview[] = latest.map(([reviewer, review]) => ({
+    reviewer,
+    state: optionalString(review, "state") as LatestReview["state"],
+    submittedAt: optionalString(review, "submitted_at"),
+    commitSha: optionalString(review, "commit_id"),
+  })).sort((left, right) => left.reviewer.localeCompare(right.reviewer));
   const recentReviews: ReviewDetail[] = reviews.slice(-20).reverse().map((review) => {
     const user = recordField(review, "user");
     return {
@@ -134,6 +145,7 @@ export async function fetchPullRequestSnapshot(owner: string, repo: string, numb
       state: optionalString(review, "state") ?? "COMMENTED",
       body: truncate(optionalString(review, "body") ?? "", 1_000),
       submittedAt: optionalString(review, "submitted_at"),
+      commitSha: optionalString(review, "commit_id"),
       url: optionalString(review, "html_url") ?? stringField(pull, "html_url"),
     };
   });
@@ -151,6 +163,7 @@ export async function fetchPullRequestSnapshot(owner: string, repo: string, numb
     number,
     url: stringField(pull, "html_url"),
     title: truncate(stringField(pull, "title"), 200),
+    authorLogin: stringField(author, "login"),
     state: stringField(pull, "state") === "closed" ? "closed" : "open",
     draft: Boolean(pull.draft),
     merged: Boolean(pull.merged),
@@ -158,6 +171,8 @@ export async function fetchPullRequestSnapshot(owner: string, repo: string, numb
     baseRef,
     approvals,
     changesRequestedBy,
+    requestedReviewers,
+    latestReviews,
     reviewRequirement: {
       requiredApprovals: rules.requiredApprovals,
       decision: reviewState.decision,

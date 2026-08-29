@@ -7,7 +7,10 @@ export type TaskResolution = (typeof TASK_RESOLUTIONS)[number];
 export const ASSIGNMENT_KINDS = ["planning", "implementation"] as const;
 export type AssignmentKind = (typeof ASSIGNMENT_KINDS)[number];
 
-export const AGENT_PHASES = ["investigating", "planning", "implementing", "testing", "waiting", "blocked"] as const;
+export const ASSIGNMENT_FOCUSES = ["planning", "implementation", "review_feedback", "fix_checks", "merge_preparation"] as const;
+export type AssignmentFocus = (typeof ASSIGNMENT_FOCUSES)[number];
+
+export const AGENT_PHASES = ["investigating", "planning", "reviewing", "implementing", "testing", "waiting", "blocked"] as const;
 export type AgentPhase = (typeof AGENT_PHASES)[number];
 
 export interface AgentStats {
@@ -29,6 +32,7 @@ export interface AssignmentView {
   id: string;
   taskId: string;
   kind: AssignmentKind;
+  focus: AssignmentFocus;
   userId: string;
   userLogin: string;
   agentLabel: string;
@@ -65,13 +69,22 @@ export interface ReviewDetail {
   state: string;
   body: string;
   submittedAt: string | null;
+  commitSha: string | null;
   url: string;
+}
+
+export interface LatestReview {
+  reviewer: string;
+  state: "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED";
+  submittedAt: string | null;
+  commitSha: string | null;
 }
 
 export interface PullRequestSnapshot {
   number: number;
   url: string;
   title: string;
+  authorLogin: string;
   state: "open" | "closed";
   draft: boolean;
   merged: boolean;
@@ -79,6 +92,8 @@ export interface PullRequestSnapshot {
   baseRef: string;
   approvals: number;
   changesRequestedBy: string[];
+  requestedReviewers: string[];
+  latestReviews: LatestReview[];
   reviewRequirement: {
     requiredApprovals: number | null;
     decision: "approved" | "changes_requested" | "review_required" | null;
@@ -139,6 +154,7 @@ export interface BoardView {
   materialized: boolean;
   revision: number;
   viewer: Viewer;
+  archivedTaskCount: number;
   tasks: TaskView[];
 }
 
@@ -160,7 +176,7 @@ export interface CommandEnvelope<T = BoardCommand> {
 export type BoardCommand =
   | { type: "create_task"; title: string; description: string }
   | { type: "edit_task"; taskId: string; title: string; description: string }
-  | { type: "claim_task"; taskId: string; kind: AssignmentKind; agentLabel: string }
+  | { type: "claim_task"; taskId: string; kind: AssignmentKind; focus?: AssignmentFocus; agentLabel: string }
   | { type: "renew_assignment"; assignmentId: string }
   | { type: "report_progress"; assignmentId: string; phase: AgentPhase; summary: string; stats: AgentStats }
   | { type: "set_plan"; assignmentId: string; markdown: string }

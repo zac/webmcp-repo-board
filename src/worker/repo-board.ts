@@ -8,6 +8,7 @@ import {
   type Actor,
   type AgentPhase,
   type AgentStats,
+  type AssignmentFocus,
   type AssignmentKind,
   type AssignmentView,
   type BoardSocketMessage,
@@ -58,6 +59,7 @@ interface AssignmentRow extends Record<string, SqlStorageValue> {
   id: string;
   task_id: string;
   kind: AssignmentKind;
+  focus: AssignmentFocus;
   user_id: string;
   user_login: string;
   agent_label: string;
@@ -393,6 +395,12 @@ export class RepoBoard extends DurableObject<Env> {
       case "claim_task": {
         const task = this.requireTask(command.taskId);
         assertClaimAllowed(task.column_name, command.kind, task.archived_at);
+        const focus = command.focus ?? (command.kind === "planning" ? "planning" : "implementation");
+        if (command.kind === "planning" && focus !== "planning") throw new BoardError("invalid_assignment_focus", "Planning assignments require planning focus", 409);
+        if (command.kind === "implementation" && focus === "planning") throw new BoardError("invalid_assignment_focus", "Implementation assignments cannot use planning focus", 409);
+        if (task.column_name !== "in_pr" && command.kind === "implementation" && focus !== "implementation") {
+          throw new BoardError("invalid_assignment_focus", "Specialized implementation focus is available only for In PR tasks", 409);
+        }
         const active = this.activeAssignment(task.id, now);
         if (active) throw new BoardError(
           "assignment_conflict",
@@ -402,13 +410,17 @@ export class RepoBoard extends DurableObject<Env> {
         );
         this.ctx.storage.sql.exec("UPDATE assignments SET status = 'expired' WHERE task_id = ? AND status = 'active' AND lease_expires_at <= ?", task.id, now);
         const assignmentId = crypto.randomUUID();
-        const phase: AgentPhase = command.kind === "planning" ? "planning" : "investigating";
+        const phase: AgentPhase = focus === "planning" ? "planning"
+          : focus === "review_feedback" ? "reviewing"
+            : focus === "fix_checks" || focus === "merge_preparation" ? "testing"
+              : "investigating";
         this.ctx.storage.sql.exec(
-          `INSERT INTO assignments (id, task_id, kind, user_id, user_login, agent_label, status, claimed_at, last_activity_at, lease_expires_at, phase, summary, stats_json)
-           VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, '', '{}')`,
+          `INSERT INTO assignments (id, task_id, kind, focus, user_id, user_login, agent_label, status, claimed_at, last_activity_at, lease_expires_at, phase, summary, stats_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, '', '{}')`,
           assignmentId,
           task.id,
           command.kind,
+          focus,
           actor.userId,
           actor.login,
           command.agentLabel,
@@ -418,7 +430,7 @@ export class RepoBoard extends DurableObject<Env> {
           phase,
         );
         this.ctx.storage.sql.exec("UPDATE tasks SET updated_at = ?, task_revision = ? WHERE id = ?", now, revision, task.id);
-        return { type: "task_claimed", taskId: task.id, data: { assignmentId, kind: command.kind, agentLabel: command.agentLabel } };
+        return { type: "task_claimed", taskId: task.id, data: { assignmentId, kind: command.kind, focus, agentLabel: command.agentLabel } };
       }
       case "renew_assignment": {
         const assignment = this.requireAssignment(command.assignmentId, actor, now);
@@ -455,8 +467,8 @@ export class RepoBoard extends DurableObject<Env> {
         this.insertPlan(task.id, planRevision, command.markdown, actor, now);
         this.ctx.storage.sql.exec("UPDATE assignments SET status = 'completed', last_activity_at = ? WHERE id = ?", now, planningAssignment.id);
         this.ctx.storage.sql.exec(
-          `INSERT INTO assignments (id, task_id, kind, user_id, user_login, agent_label, status, claimed_at, last_activity_at, lease_expires_at, phase, summary, stats_json)
-           VALUES (?, ?, 'implementation', ?, ?, ?, 'active', ?, ?, ?, 'implementing', 'Implementation started', '{}')`,
+          `INSERT INTO assignments (id, task_id, kind, focus, user_id, user_login, agent_label, status, claimed_at, last_activity_at, lease_expires_at, phase, summary, stats_json)
+           VALUES (?, ?, 'implementation', 'implementation', ?, ?, ?, 'active', ?, ?, ?, 'implementing', 'Implementation started', '{}')`,
           implementationAssignmentId,
           task.id,
           actor.userId,
@@ -605,6 +617,13 @@ export class RepoBoard extends DurableObject<Env> {
         this.ctx.storage.sql.exec("INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (2, ?)", Date.now());
       });
     }
+    if (migration < 3) {
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec("ALTER TABLE assignments ADD COLUMN focus TEXT NOT NULL DEFAULT 'implementation'");
+        this.ctx.storage.sql.exec("UPDATE assignments SET focus = 'planning' WHERE kind = 'planning'");
+        this.ctx.storage.sql.exec("INSERT INTO _sql_schema_migrations (id, applied_at) VALUES (3, ?)", Date.now());
+      });
+    }
   }
 
   private getMetadata(): BoardMetadata | null {
@@ -693,7 +712,10 @@ export class RepoBoard extends DurableObject<Env> {
       .exec<TaskRow>(`SELECT * FROM tasks ${includeArchived ? "" : "WHERE archived_at IS NULL"} ORDER BY created_at ASC LIMIT ?`, MAX_TASKS)
       .toArray()
       .map((task) => this.buildTaskView(task, viewer));
-    return { ...metadata, materialized: true, revision: this.currentRevision(), viewer, tasks };
+    const archivedTaskCount = this.ctx.storage.sql
+      .exec<{ count: number }>("SELECT COUNT(*) AS count FROM tasks WHERE archived_at IS NOT NULL")
+      .one().count;
+    return { ...metadata, materialized: true, revision: this.currentRevision(), viewer, archivedTaskCount, tasks };
   }
 
   private buildTaskView(task: TaskRow, viewer: Viewer): TaskView {
@@ -799,7 +821,11 @@ function storedPullRequest(value: string): PullRequestSnapshot {
   const snapshot = JSON.parse(value) as PullRequestSnapshot;
   return {
     ...snapshot,
+    authorLogin: snapshot.authorLogin ?? "",
     baseRef: snapshot.baseRef ?? "",
+    requestedReviewers: snapshot.requestedReviewers ?? [],
+    latestReviews: snapshot.latestReviews ?? [],
+    recentReviews: (snapshot.recentReviews ?? []).map((review) => ({ ...review, commitSha: review.commitSha ?? null })),
     reviewRequirement: snapshot.reviewRequirement ?? {
       requiredApprovals: null,
       decision: null,
@@ -815,6 +841,7 @@ function assignmentView(row: AssignmentRow, viewerUserId: string | null): Assign
     id: row.id,
     taskId: row.task_id,
     kind: row.kind,
+    focus: row.focus,
     userId: row.user_id,
     userLogin: row.user_login,
     agentLabel: row.agent_label,

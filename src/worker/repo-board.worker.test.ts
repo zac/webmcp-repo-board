@@ -21,7 +21,10 @@ function pullRequest(overrides: Partial<PullRequestSnapshot> = {}): PullRequestS
     headSha: "deadbeef",
     baseRef: "main",
     approvals: 0,
+    authorLogin: "builder",
     changesRequestedBy: [],
+    requestedReviewers: [],
+    latestReviews: [],
     reviewRequirement: { requiredApprovals: 2, decision: "review_required", codeOwnerReviewRequired: false, latestPushApprovalRequired: false },
     mergeState: "blocked",
     reviewCommentCount: 0,
@@ -116,10 +119,12 @@ describe("RepoBoard Durable Object", () => {
     expect(unwrap(await stub.applyPullRequest(pullRequest({ state: "closed", merged: true, syncedAt: 1 }), "delayed-webhook", Date.now()))).toBeNull();
     expect(unwrap(await stub.getView(viewer(ada), false)).tasks[0].column).toBe("in_pr");
     const merged = await stub.applyPullRequest(pullRequest({ state: "closed", merged: true, approvals: 2, syncedAt: newestSync + 1 }), "webhook", Date.now());
-    expect(unwrap(merged)?.tasks[0]).toMatchObject({ column: "done", resolution: "completed", resolutionReason: null });
+    expect(unwrap(merged)?.tasks[0]).toMatchObject({ column: "done", resolution: "completed", resolutionReason: null, assignment: null });
     view = unwrap(await command(stub, zac, 10, { type: "archive_task", taskId }));
     expect(view.tasks).toHaveLength(0);
+    expect(view.archivedTaskCount).toBe(1);
     const history = unwrap(await stub.getView(viewer(zac), true));
+    expect(history.archivedTaskCount).toBe(1);
     expect(history.tasks[0]).toMatchObject({ resolution: "completed", resolutionReason: null });
     expect(history.tasks[0].archivedAt).not.toBeNull();
   });
@@ -134,7 +139,9 @@ describe("RepoBoard Durable Object", () => {
     view = unwrap(await command(stub, zac, 2, { type: "cancel_task", taskId, reason: "The upstream API now provides this behavior." }));
 
     expect(view.tasks).toHaveLength(0);
+    expect(view.archivedTaskCount).toBe(1);
     const history = unwrap(await stub.getView(viewer(zac), true));
+    expect(history.archivedTaskCount).toBe(1);
     expect(history.tasks[0]).toMatchObject({
       resolution: "canceled",
       resolutionReason: "The upstream API now provides this behavior.",
@@ -176,6 +183,28 @@ describe("RepoBoard Durable Object", () => {
     const formerMutation = await command(stub, zac, 3, { type: "report_progress", assignmentId: planningId, phase: "planning", summary: "Old lease", stats: {} });
     expect(formerMutation.ok).toBe(false);
     if (!formerMutation.ok) expect(formerMutation.error.code).toBe("assignment_inactive");
+  });
+
+  it("uses the task-wide lease to serialize feedback-addressing work", async () => {
+    const stub = await freshBoard("feedback-lock");
+    let view = unwrap(await command(stub, zac, 0, { type: "create_task", title: "Address review", description: "Keep author work exclusive" }));
+    const taskId = view.tasks[0].id;
+    view = unwrap(await command(stub, zac, 1, { type: "claim_task", taskId, kind: "planning", agentLabel: "Planner" }));
+    unwrap(await command(stub, zac, 2, { type: "set_plan", assignmentId: view.tasks[0].assignment!.id, markdown: "Plan" }));
+    view = unwrap(await command(stub, zac, 3, { type: "claim_task", taskId, kind: "implementation", agentLabel: "Builder" }));
+    view = unwrap(await command(stub, zac, 4, { type: "start_work", assignmentId: view.tasks[0].assignment!.id }));
+    view = unwrap(await command(stub, zac, 5, { type: "link_pull_request_snapshot", assignmentId: view.tasks[0].assignment!.id, snapshot: pullRequest({ authorLogin: "zac", changesRequestedBy: ["reviewer"] }) }));
+    unwrap(await command(stub, zac, 6, { type: "release_task", assignmentId: view.tasks[0].assignment!.id }));
+
+    view = unwrap(await command(stub, zac, 7, { type: "claim_task", taskId, kind: "implementation", focus: "review_feedback", agentLabel: "Feedback agent" }));
+    expect(view.tasks[0]).toMatchObject({
+      column: "in_pr",
+      assignment: { focus: "review_feedback", phase: "reviewing", agentLabel: "Feedback agent" },
+    });
+
+    const competing = await command(stub, ada, 8, { type: "claim_task", taskId, kind: "implementation", focus: "fix_checks", agentLabel: "Checks agent" });
+    expect(competing.ok).toBe(false);
+    if (!competing.ok) expect(competing.error).toMatchObject({ code: "assignment_conflict", ownerLogin: "zac", currentRevision: 8 });
   });
 
   it("returns closed-unmerged work to In Progress and rejects invalid archival", async () => {

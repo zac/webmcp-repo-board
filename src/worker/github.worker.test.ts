@@ -70,14 +70,16 @@ describe("GitHub boundaries", () => {
       state: "open",
       draft: false,
       merged: false,
+      user: { login: "builder" },
+      requested_reviewers: [{ login: "carol" }],
       head: { sha: "sha-9" },
       base: { ref: "main" },
     });
     responses.set("/repos/acme/widgets/pulls/9/reviews?per_page=100", [
-      { id: 1, user: { login: "alice" }, state: "APPROVED", body: "Earlier", submitted_at: "2026-01-01T00:00:00Z", html_url: "https://github.com/review/1" },
-      { id: 2, user: { login: "alice" }, state: "CHANGES_REQUESTED", body: "Please fix", submitted_at: "2026-01-02T00:00:00Z", html_url: "https://github.com/review/2" },
-      { id: 3, user: { login: "bob" }, state: "APPROVED", body: "Looks good", submitted_at: "2026-01-03T00:00:00Z", html_url: "https://github.com/review/3" },
-      { id: 4, user: { login: "bob" }, state: "COMMENTED", body: "One note", submitted_at: "2026-01-04T00:00:00Z", html_url: "https://github.com/review/4" },
+      { id: 1, user: { login: "alice" }, state: "APPROVED", body: "Earlier", submitted_at: "2026-01-01T00:00:00Z", commit_id: "old-sha", html_url: "https://github.com/review/1" },
+      { id: 2, user: { login: "alice" }, state: "CHANGES_REQUESTED", body: "Please fix", submitted_at: "2026-01-02T00:00:00Z", commit_id: "old-sha", html_url: "https://github.com/review/2" },
+      { id: 3, user: { login: "bob" }, state: "APPROVED", body: "Looks good", submitted_at: "2026-01-03T00:00:00Z", commit_id: "sha-9", html_url: "https://github.com/review/3" },
+      { id: 4, user: { login: "bob" }, state: "COMMENTED", body: "One note", submitted_at: "2026-01-04T00:00:00Z", commit_id: "sha-9", html_url: "https://github.com/review/4" },
     ]);
     responses.set("/repos/acme/widgets/pulls/9/comments?per_page=100", [{ id: 1 }, { id: 2 }]);
     responses.set("/repos/acme/widgets/issues/9/comments?per_page=100", [{ id: 1 }]);
@@ -109,8 +111,10 @@ describe("GitHub boundaries", () => {
     const result = await fetchPullRequestSnapshot("acme", "widgets", 9, "installation-token");
     expect(result).toMatchObject({
       approvals: 1,
+      authorLogin: "builder",
       baseRef: "main",
       changesRequestedBy: ["alice"],
+      requestedReviewers: ["carol"],
       reviewRequirement: {
         requiredApprovals: 2,
         decision: "review_required",
@@ -129,6 +133,11 @@ describe("GitHub boundaries", () => {
       },
     });
     expect(result.recentReviews.map((review) => review.id)).toEqual([4, 3, 2, 1]);
+    expect(result.recentReviews[0].commitSha).toBe("sha-9");
+    expect(result.latestReviews).toEqual([
+      { reviewer: "alice", state: "CHANGES_REQUESTED", submittedAt: "2026-01-02T00:00:00Z", commitSha: "old-sha" },
+      { reviewer: "bob", state: "APPROVED", submittedAt: "2026-01-03T00:00:00Z", commitSha: "sha-9" },
+    ]);
   });
 
   it("keeps the core pull request snapshot when review-rule metadata is unavailable", async () => {
@@ -136,6 +145,7 @@ describe("GitHub boundaries", () => {
       const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
       if (url.pathname.endsWith("/pulls/10")) return Response.json({
         html_url: "https://github.com/acme/widgets/pull/10", title: "Small fix", state: "open", draft: false, merged: false,
+        user: { login: "builder" }, requested_reviewers: [],
         head: { sha: "sha-10" }, base: { ref: "main" },
       });
       if (url.pathname === "/graphql" || url.pathname.includes("/rules/branches/")) return Response.json({ message: "Unavailable" }, { status: 403 });

@@ -1,4 +1,4 @@
-import { AGENT_PHASES, ASSIGNMENT_KINDS, TASK_COLUMNS, type AgentPhase, type AgentStats, type AssignmentKind, type BoardCommand, type CommandEnvelope } from "./types";
+import { AGENT_PHASES, ASSIGNMENT_FOCUSES, ASSIGNMENT_KINDS, TASK_COLUMNS, type AgentPhase, type AgentStats, type AssignmentKind, type BoardCommand, type CommandEnvelope } from "./types";
 
 export class ValidationError extends Error {
   constructor(public readonly code: string, message: string, public readonly status = 400) {
@@ -23,7 +23,13 @@ export function parseCommandEnvelope(value: unknown): CommandEnvelope {
       command = { type, taskId: identifier(commandObject.taskId, "taskId"), title: boundedString(commandObject.title, "title", 1, 120), description: boundedString(commandObject.description ?? "", "description", 0, 10_000) };
       break;
     case "claim_task":
-      command = { type, taskId: identifier(commandObject.taskId, "taskId"), kind: enumValue(commandObject.kind, ASSIGNMENT_KINDS, "kind"), agentLabel: boundedString(commandObject.agentLabel, "agentLabel", 1, 80) };
+      command = {
+        type,
+        taskId: identifier(commandObject.taskId, "taskId"),
+        kind: enumValue(commandObject.kind, ASSIGNMENT_KINDS, "kind"),
+        ...(commandObject.focus === undefined ? {} : { focus: enumValue(commandObject.focus, ASSIGNMENT_FOCUSES, "focus") }),
+        agentLabel: boundedString(commandObject.agentLabel, "agentLabel", 1, 80),
+      };
       break;
     case "report_progress":
       command = { type, assignmentId: identifier(commandObject.assignmentId, "assignmentId"), phase: enumValue(commandObject.phase, AGENT_PHASES, "phase"), summary: boundedString(commandObject.summary, "summary", 1, 500), stats: parseStats(commandObject.stats) };
