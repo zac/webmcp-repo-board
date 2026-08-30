@@ -339,11 +339,11 @@ describe("RepositoryBoard Durable Object", () => {
 
   it("bounds retained webhook receipts", async () => {
     const stub = await freshBoard("webhook-retention");
-    for (let index = 0; index < 2_050; index += 1) await stub.beginWebhook(`delivery-${index}`, index);
-    await runInDurableObject(stub, async (_instance, state) => {
+    await runInDurableObject(stub, async (instance, state) => {
+      for (let index = 0; index < 2_050; index += 1) expect(await instance.beginWebhook(`delivery-${index}`, index)).toBe(true);
       expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM processed_webhooks").one().count).toBe(2_000);
     });
-  }, 15_000);
+  });
 
   it("releases ownership immediately and rejects the former assignment", async () => {
     const stub = await freshBoard("release");
