@@ -26,6 +26,10 @@
     {
       "tag": "v2",
       "new_sqlite_classes": ["RepositoryBoard"]
+    },
+    {
+      "tag": "v3",
+      "deleted_classes": ["RepoBoard"]
     }
   ],
   "d1_databases": [

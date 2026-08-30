@@ -43,7 +43,7 @@ import {
 } from "./github";
 import { RepositoryBoard } from "./repo-board";
 
-export { RepositoryBoard, RepositoryBoard as RepoBoard };
+export { RepositoryBoard };
 
 interface BoardRecord {
   id: string;
