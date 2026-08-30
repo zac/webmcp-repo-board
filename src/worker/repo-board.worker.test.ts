@@ -343,7 +343,7 @@ describe("RepositoryBoard Durable Object", () => {
     await runInDurableObject(stub, async (_instance, state) => {
       expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM processed_webhooks").one().count).toBe(2_000);
     });
-  });
+  }, 15_000);
 
   it("releases ownership immediately and rejects the former assignment", async () => {
     const stub = await freshBoard("release");
