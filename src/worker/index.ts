@@ -57,7 +57,12 @@ interface BoardRecord {
 }
 
 class RequestError extends Error {
-  constructor(public readonly code: string, message: string, public readonly status: number) {
+  constructor(
+    public readonly code: string,
+    message: string,
+    public readonly status: number,
+    public readonly details: { currentRevision?: number; ownerLogin?: string; leaseExpiresAt?: number } = {},
+  ) {
     super(message);
     this.name = "RequestError";
   }
@@ -608,7 +613,11 @@ async function readJson(request: Request): Promise<unknown> {
 
 function unwrap<T>(result: RpcResult<T>): T {
   if (result.ok) return result.value;
-  throw new RequestError(result.error.code, result.error.message, result.error.status);
+  throw new RequestError(result.error.code, result.error.message, result.error.status, {
+    currentRevision: result.error.currentRevision,
+    ownerLogin: result.error.ownerLogin,
+    leaseExpiresAt: result.error.leaseExpiresAt,
+  });
 }
 
 function decodeRepoPart(value: string): string {
@@ -650,7 +659,11 @@ function finiteInteger(value: unknown): number | null {
 
 function errorResponse(error: unknown): Response {
   if (error instanceof RequestError || error instanceof ValidationError || error instanceof GitHubError) {
-    return Response.json({ error: error.code, message: error.message }, { status: error.status });
+    return Response.json({
+      error: error.code,
+      message: error.message,
+      ...(error instanceof RequestError ? error.details : {}),
+    }, { status: error.status });
   }
   console.error(JSON.stringify({ event: "request_failed", error: error instanceof Error ? error.message : "unknown" }));
   return Response.json({ error: "internal_error", message: "The request could not be completed" }, { status: 500 });

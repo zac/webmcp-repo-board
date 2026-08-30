@@ -147,6 +147,44 @@ describe("Worker authorization and directory routing", () => {
     expect(board.tasks.map((task) => task.assignment?.agentLabel)).toEqual(["Tab 1", "Tab 2"]);
     expect(board.tasks.every((task) => task.assignment?.userId === "one-user")).toBe(true);
   });
+
+  it("preserves structured assignment conflicts through the HTTP boundary", async () => {
+    await seedBoard("claim-conflict", false);
+    const url = "https://example.com/api/boards/acme/claim-conflict";
+    const headers = authenticated("write", "one-user", "zac", {
+      method: "POST",
+      headers: { origin: "https://example.com", "content-type": "application/json" },
+    });
+    const createdResponse = await SELF.fetch(`${url}/commands`, {
+      ...headers,
+      body: JSON.stringify({
+        actionId: crypto.randomUUID(),
+        expectedRevision: 0,
+        command: { type: "create_task", title: "Race", description: "Only one claim wins" },
+      }),
+    });
+    const created = await createdResponse.json() as BoardView;
+    const taskId = created.tasks[0].id;
+
+    const responses = await Promise.all(["Primary", "Secondary"].map((agentLabel) => SELF.fetch(`${url}/commands`, {
+      ...headers,
+      body: JSON.stringify({
+        actionId: crypto.randomUUID(),
+        expectedRevision: 1,
+        command: { type: "claim_task", taskId, kind: "planning", agentLabel },
+      }),
+    })));
+
+    expect(responses.map((response) => response.status).sort()).toEqual([200, 409]);
+    const conflictResponse = responses.find((response) => response.status === 409)!;
+    const conflict = await conflictResponse.json() as Record<string, unknown>;
+    expect(conflict).toMatchObject({
+      error: "assignment_conflict",
+      ownerLogin: "zac",
+      currentRevision: 2,
+    });
+    expect(Number(conflict.leaseExpiresAt)).toBeGreaterThan(Date.now());
+  });
 });
 
 describe("sessions and OAuth state", () => {

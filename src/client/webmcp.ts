@@ -11,6 +11,7 @@ import {
   type TaskColumn,
   type TaskView,
 } from "../shared";
+import { ApiError } from "./api";
 
 type JsonSchema = Record<string, unknown>;
 
@@ -155,13 +156,27 @@ export async function registerBoardTools(context: WebMcpContext, handlers: Board
         const requested = typeof input.taskRef === "string" ? input.taskRef : typeof input.taskId === "string" ? input.taskId : "";
         const requestedTask = findTask(handlers.getBoard().tasks, requested);
         if (!requestedTask) throw new Error(`Task reference ${requested || "(missing)"} was not found on this board`);
-        const next = await handlers.runCommand({
-          type: "claim_task",
-          taskId: requestedTask.id,
-          kind: input.kind as AssignmentKind,
-          ...(typeof input.focus === "string" ? { focus: input.focus as AssignmentFocus } : {}),
-          agentLabel: String(input.agentLabel),
-        }, toolSignal(execution, signal));
+        let next: BoardView;
+        try {
+          next = await handlers.runCommand({
+            type: "claim_task",
+            taskId: requestedTask.id,
+            kind: input.kind as AssignmentKind,
+            ...(typeof input.focus === "string" ? { focus: input.focus as AssignmentFocus } : {}),
+            agentLabel: String(input.agentLabel),
+          }, toolSignal(execution, signal));
+        } catch (caught) {
+          if (caught instanceof ApiError && caught.code === "assignment_conflict") {
+            return bounded({
+              status: "assignment_conflict",
+              message: caught.message,
+              ownerLogin: caught.details.ownerLogin ?? null,
+              leaseExpiresAt: caught.details.leaseExpiresAt ?? null,
+              currentRevision: caught.details.currentRevision ?? null,
+            });
+          }
+          throw caught;
+        }
         const task = next.tasks.find((candidate) => candidate.id === requestedTask.id);
         const guidance = task?.column === "todo"
           ? "Inspect the task and call set_plan."

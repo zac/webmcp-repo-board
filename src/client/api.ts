@@ -14,7 +14,12 @@ export interface SessionUser {
 }
 
 export class ApiError extends Error {
-  constructor(public readonly code: string, message: string, public readonly status: number) {
+  constructor(
+    public readonly code: string,
+    message: string,
+    public readonly status: number,
+    public readonly details: { currentRevision?: number; ownerLogin?: string; leaseExpiresAt?: number } = {},
+  ) {
     super(message);
     this.name = "ApiError";
   }
@@ -77,7 +82,16 @@ async function request<T>(path: string, init: RequestInit): Promise<T> {
   const response = await fetch(path, { ...init, headers, credentials: "same-origin" });
   if (!response.ok) {
     const body = await safeJson(response);
-    throw new ApiError(typeof body.error === "string" ? body.error : "request_failed", typeof body.message === "string" ? body.message : `Request failed with ${response.status}`, response.status);
+    throw new ApiError(
+      typeof body.error === "string" ? body.error : "request_failed",
+      typeof body.message === "string" ? body.message : `Request failed with ${response.status}`,
+      response.status,
+      {
+        ...(Number.isSafeInteger(body.currentRevision) ? { currentRevision: Number(body.currentRevision) } : {}),
+        ...(typeof body.ownerLogin === "string" ? { ownerLogin: body.ownerLogin } : {}),
+        ...(Number.isSafeInteger(body.leaseExpiresAt) ? { leaseExpiresAt: Number(body.leaseExpiresAt) } : {}),
+      },
+    );
   }
   if (response.status === 204) return undefined as T;
   return await response.json() as T;

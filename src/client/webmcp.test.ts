@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AssignmentKind, BoardView, PullRequestSnapshot, TaskColumn, TaskView } from "../shared";
+import { ApiError } from "./api";
 import { registerBoardTools, type BoardToolHandlers, type WebMcpContext, type WebMcpTool } from "./webmcp";
 
 class Registry implements WebMcpContext {
@@ -123,6 +124,34 @@ describe("dynamic WebMCP profiles", () => {
 
   it("exposes claiming to authorized unassigned viewers", async () => {
     expect(await namesFor(board(task("ready")))).toEqual(["list_tasks", "inspect_task", "cancel_task", "claim_task"]);
+  });
+
+  it("returns assignment conflicts as bounded structured tool results", async () => {
+    const registry = new Registry();
+    const boardValue = board(task("todo"));
+    const toolHandlers = handlers(boardValue);
+    toolHandlers.runCommand = vi.fn(async () => {
+      throw new ApiError("assignment_conflict", "zac owns this task", 409, {
+        ownerLogin: "zac",
+        leaseExpiresAt: 123_456,
+        currentRevision: 4,
+      });
+    });
+    await registerBoardTools(registry, toolHandlers, new AbortController().signal);
+
+    const result = await registry.tools.get("claim_task")!.execute({
+      taskRef: "quiet-pine",
+      kind: "planning",
+      agentLabel: "Secondary",
+    });
+
+    expect(JSON.parse(String(result))).toEqual({
+      status: "assignment_conflict",
+      message: "zac owns this task",
+      ownerLogin: "zac",
+      leaseExpiresAt: 123_456,
+      currentRevision: 4,
+    });
   });
 
   it("exposes reviewer-safe PR tools without taking the implementation lease", async () => {

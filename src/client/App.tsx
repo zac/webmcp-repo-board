@@ -67,6 +67,12 @@ interface CancelRequest {
 
 type CodexPromptIntent = "planning" | "implementation" | "review_feedback" | "fix_checks" | "review_updates" | "merge_preparation";
 
+export function socketReconnectPolicy(code: number): { status: "connecting" | "offline"; delay: number } {
+  return code === 4000
+    ? { status: "connecting", delay: 0 }
+    : { status: "offline", delay: 1_500 };
+}
+
 export interface PullRequestViewerRelationship {
   label: string;
   detail: string;
@@ -339,11 +345,12 @@ export function App(): ReactNode {
           setRealtime("offline");
         }
       });
-      currentSocket.addEventListener("close", () => {
+      currentSocket.addEventListener("close", (event) => {
         window.clearTimeout(refreshTimer);
         if (disposed) return;
-        setRealtime("offline");
-        reconnectTimer = window.setTimeout(connect, 1_500);
+        const policy = socketReconnectPolicy(event.code);
+        setRealtime(policy.status);
+        reconnectTimer = window.setTimeout(connect, policy.delay);
       });
       refreshTimer = window.setTimeout(() => currentSocket.close(4000, "Refresh authorization"), 20_000);
     };

@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import type { BoardView, TaskView } from "../shared";
-import { codexPrompt, repositoryGateCopy } from "./App";
+import { codexPrompt, repositoryGateCopy, socketReconnectPolicy } from "./App";
+
+describe("realtime connection state", () => {
+  it("treats planned authorization rotation as reconnecting instead of offline", () => {
+    expect(socketReconnectPolicy(4000)).toEqual({ status: "connecting", delay: 0 });
+    expect(socketReconnectPolicy(1006)).toEqual({ status: "offline", delay: 1_500 });
+  });
+});
 
 describe("repository access gate", () => {
   it("asks a logged-out viewer to sign in without confirming repository existence", () => {
