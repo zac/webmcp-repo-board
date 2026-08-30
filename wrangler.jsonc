@@ -14,7 +14,7 @@
     "bindings": [
       {
         "name": "REPO_BOARD",
-        "class_name": "RepoBoard"
+        "class_name": "RepositoryBoard"
       }
     ]
   },
@@ -22,6 +22,11 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["RepoBoard"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["RepositoryBoard"],
+      "deleted_classes": ["RepoBoard"]
     }
   ],
   "d1_databases": [

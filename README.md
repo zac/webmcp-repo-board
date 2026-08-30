@@ -35,7 +35,7 @@ Cloudflare Worker ─── GitHub App API + webhooks
         │
         ├── D1: identities, hashed sessions, installations, board directory
         │
-        └── RepoBoard Durable Object: tasks, plans, leases, PR snapshots, event log
+        └── RepositoryBoard Durable Object: tasks, plans, leases, PR snapshots, event log
 ```
 
 GitHub calls finish in the Worker before a normalized snapshot is applied to the Durable Object. No serialized state path stays open across an external network request.

@@ -32,7 +32,7 @@ Assignments use renewable 15-minute leases. Assignment tool calls renew the leas
 
 ### Storage and real-time state
 
-- One SQLite-backed `RepoBoard` Durable Object per `owner/repo`.
+- One SQLite-backed `RepositoryBoard` Durable Object per `owner/repo`.
 - Its SQLite database owns tasks and their unique two-word references, plan revisions, assignments, progress reports, PR snapshots, processed actions, processed webhook deliveries, and the append-only board event log.
 - D1 stores only global data: GitHub identities, hashed web sessions, installations, and the `owner/repo → boardId` directory for materialized boards. Public previews are cached briefly at the edge and do not create database state.
 - Accepted commands update Durable Object SQLite atomically, increment the board revision, and then broadcast a revisioned update through hibernating WebSockets.

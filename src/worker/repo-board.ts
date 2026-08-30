@@ -94,7 +94,7 @@ interface LinkedPullRequest {
   generation: number;
 }
 
-export class RepoBoard extends DurableObject<Env> {
+export class RepositoryBoard extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     void ctx.blockConcurrencyWhile(async () => this.migrate());

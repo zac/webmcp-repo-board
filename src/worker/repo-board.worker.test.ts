@@ -1,7 +1,7 @@
 import { env, evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { Actor, BoardView, CommandEnvelope, InternalBoardCommand, PullRequestSnapshot, RpcResult, Viewer } from "../shared";
-import { boardIdentityMatches, type RepoBoard } from "./repo-board";
+import { boardIdentityMatches, type RepositoryBoard } from "./repo-board";
 
 const zac: Actor = { userId: "user-zac", login: "zac" };
 const ada: Actor = { userId: "user-ada", login: "ada" };
@@ -36,7 +36,7 @@ function pullRequest(overrides: Partial<PullRequestSnapshot> = {}): PullRequestS
   };
 }
 
-async function freshBoard(label: string): Promise<DurableObjectStub<RepoBoard>> {
+async function freshBoard(label: string): Promise<DurableObjectStub<RepositoryBoard>> {
   const stub = env.REPO_BOARD.getByName(`${label}-${crypto.randomUUID()}`);
   await stub.initialize({
     id: crypto.randomUUID(),
@@ -52,7 +52,7 @@ async function freshBoard(label: string): Promise<DurableObjectStub<RepoBoard>> 
 }
 
 async function command(
-  stub: DurableObjectStub<RepoBoard>,
+  stub: DurableObjectStub<RepositoryBoard>,
   actor: Actor,
   expectedRevision: number,
   value: InternalBoardCommand,
@@ -71,7 +71,7 @@ function unwrap<T>(result: RpcResult<T>): T {
   return result.value;
 }
 
-describe("RepoBoard Durable Object", () => {
+describe("RepositoryBoard Durable Object", () => {
   it("boots one strict canonical schema and rejects identity changes", async () => {
     const stub = await freshBoard("canonical-schema");
     await runInDurableObject(stub, async (_instance, state) => {

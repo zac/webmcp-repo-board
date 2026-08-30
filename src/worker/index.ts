@@ -41,9 +41,9 @@ import {
   verifyWebhookSignature,
   type GitHubRepository,
 } from "./github";
-import { RepoBoard } from "./repo-board";
+import { RepositoryBoard } from "./repo-board";
 
-export { RepoBoard };
+export { RepositoryBoard };
 
 interface BoardRecord {
   id: string;
@@ -575,7 +575,7 @@ async function boardRecord(env: Env, owner: string, repo: string): Promise<Board
     .bind(owner, repo).first<BoardRecord>();
 }
 
-function boardStub(env: Env, id: string): DurableObjectStub<RepoBoard> {
+function boardStub(env: Env, id: string): DurableObjectStub<RepositoryBoard> {
   return env.REPO_BOARD.getByName(id);
 }
 
