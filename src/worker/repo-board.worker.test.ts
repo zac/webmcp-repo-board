@@ -1,6 +1,6 @@
 import { env, evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { Actor, BoardView, CommandEnvelope, InternalBoardCommand, PullRequestSnapshot, RpcResult, Viewer } from "../shared";
+import type { Actor, BoardSocketMessage, BoardView, ClientIdentity, CommandEnvelope, InternalBoardCommand, PullRequestSnapshot, RpcResult, Viewer } from "../shared";
 import { boardIdentityMatches, type RepositoryBoard } from "./repo-board";
 
 const zac: Actor = { userId: "user-zac", login: "zac" };
@@ -8,6 +8,10 @@ const ada: Actor = { userId: "user-ada", login: "ada" };
 
 function viewer(actor: Actor): Viewer {
   return { userId: actor.userId, login: actor.login, avatarUrl: null, roleName: "write", canMutate: true };
+}
+
+function client(actor: Actor, suffix = "primary"): ClientIdentity {
+  return { id: `client-${actor.userId}-${suffix}`, capabilityHash: `capability-${actor.userId}-${suffix}` };
 }
 
 function pullRequest(overrides: Partial<PullRequestSnapshot> = {}): PullRequestSnapshot {
@@ -56,14 +60,14 @@ async function command(
   actor: Actor,
   expectedRevision: number,
   value: InternalBoardCommand,
-  options: { actionId?: string; now?: number } = {},
+  options: { actionId?: string; now?: number; client?: ClientIdentity } = {},
 ): Promise<RpcResult<BoardView>> {
   const envelope: CommandEnvelope<InternalBoardCommand> = {
     actionId: options.actionId ?? crypto.randomUUID(),
     expectedRevision,
     command: value,
   };
-  return stub.execute(actor, viewer(actor), envelope, options.now ?? Date.now());
+  return stub.execute(actor, viewer(actor), options.client ?? client(actor), envelope, options.now ?? Date.now());
 }
 
 function unwrap<T>(result: RpcResult<T>): T {
@@ -103,7 +107,7 @@ describe("RepositoryBoard Durable Object", () => {
     for (const reference of references) expect(reference).toMatch(/^[a-z]{3,6}-[a-z]{3,6}$/);
   });
 
-  it("serializes simultaneous claims and returns the winner's lease in a structured conflict", async () => {
+  it("serializes simultaneous claims and returns the durable owner in a structured conflict", async () => {
     const stub = await freshBoard("claim-race");
     const created = unwrap(await command(stub, zac, 0, { type: "create_task", title: "Race", description: "Only one agent may win" }));
     const taskId = created.tasks[0].id;
@@ -122,7 +126,7 @@ describe("RepositoryBoard Durable Object", () => {
     if (!loser.ok) {
       expect(loser.error.code).toBe("assignment_conflict");
       expect(loser.error.ownerLogin).toMatch(/zac|ada/);
-      expect(loser.error.leaseExpiresAt).toBeGreaterThan(Date.now());
+      expect(loser.error.ownerAgentLabel).toMatch(/Codex/);
       expect(loser.error.currentRevision).toBe(2);
     }
   });
@@ -152,14 +156,14 @@ describe("RepositoryBoard Durable Object", () => {
     const newestSync = Date.now() + 10_000;
     const approvalRefresh = unwrap(await stub.reservePullRequestRefresh(taskId));
     unwrap(await stub.applyPullRequest(pullRequest({ approvals: 2, syncedAt: newestSync }), "manual", Date.now(), approvalRefresh.generation));
-    expect(unwrap(await stub.getView(viewer(ada), false)).tasks[0].column).toBe("in_pr");
+    expect(unwrap(await stub.getView(viewer(ada), false, client(ada).id)).tasks[0].column).toBe("in_pr");
     const mergeRefresh = unwrap(await stub.reservePullRequestRefresh(taskId));
     const merged = await stub.applyPullRequest(pullRequest({ state: "closed", merged: true, approvals: 2, syncedAt: newestSync + 1 }), "webhook", Date.now(), mergeRefresh.generation);
     expect(unwrap(merged)?.tasks[0]).toMatchObject({ column: "done", resolution: "completed", resolutionReason: null, assignment: null });
     view = unwrap(await command(stub, zac, 10, { type: "archive_task", taskId }));
     expect(view.tasks).toHaveLength(0);
     expect(view.archivedTaskCount).toBe(1);
-    const history = unwrap(await stub.getView(viewer(zac), true));
+    const history = unwrap(await stub.getView(viewer(zac), true, client(zac).id));
     expect(history.archivedTaskCount).toBe(1);
     expect(history.tasks[0]).toMatchObject({ resolution: "completed", resolutionReason: null });
     expect(history.tasks[0].reference).toBe(taskReference);
@@ -195,7 +199,7 @@ describe("RepositoryBoard Durable Object", () => {
     const second = unwrap(await stub.reservePullRequestRefresh(taskId));
     unwrap(await stub.applyPullRequest(pullRequest({ state: "closed", merged: true }), "newer", Date.now(), second.generation));
     expect(unwrap(await stub.applyPullRequest(pullRequest({ state: "open", merged: false }), "older", Date.now(), first.generation))).toBeNull();
-    expect(unwrap(await stub.getView(viewer(zac), false)).tasks[0]).toMatchObject({ column: "done", resolution: "completed" });
+    expect(unwrap(await stub.getView(viewer(zac), false, client(zac).id)).tasks[0]).toMatchObject({ column: "done", resolution: "completed" });
     await runInDurableObject(stub, async (instance, state) => {
       expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM events").one().count).toBe(5_000);
       state.storage.sql.exec(`WITH RECURSIVE sequence(value) AS (
@@ -219,7 +223,7 @@ describe("RepositoryBoard Durable Object", () => {
 
     expect(view.tasks).toHaveLength(0);
     expect(view.archivedTaskCount).toBe(1);
-    const history = unwrap(await stub.getView(viewer(zac), true));
+    const history = unwrap(await stub.getView(viewer(zac), true, client(zac).id));
     expect(history.archivedTaskCount).toBe(1);
     expect(history.tasks[0]).toMatchObject({
       resolution: "canceled",
@@ -254,17 +258,18 @@ describe("RepositoryBoard Durable Object", () => {
         phase: "implementing",
         summary: "Implementation started",
         isMine: true,
+        isCurrentClient: true,
       },
     });
     expect(view.tasks[0].assignment?.id).not.toBe(planningId);
     expect(view.tasks[0].recentEvents.map((event) => event.type)).toEqual(expect.arrayContaining(["plan_set", "work_started"]));
 
-    const formerMutation = await command(stub, zac, 3, { type: "report_progress", assignmentId: planningId, phase: "planning", summary: "Old lease", stats: {} });
+    const formerMutation = await command(stub, zac, 3, { type: "report_progress", assignmentId: planningId, phase: "planning", summary: "Old assignment", stats: {} });
     expect(formerMutation.ok).toBe(false);
     if (!formerMutation.ok) expect(formerMutation.error.code).toBe("assignment_inactive");
   });
 
-  it("uses the task-wide lease to serialize feedback-addressing work", async () => {
+  it("uses durable task ownership to serialize feedback-addressing work", async () => {
     const stub = await freshBoard("feedback-lock");
     let view = unwrap(await command(stub, zac, 0, { type: "create_task", title: "Address review", description: "Keep author work exclusive" }));
     const taskId = view.tasks[0].id;
@@ -308,7 +313,7 @@ describe("RepositoryBoard Durable Object", () => {
     expect(closed?.tasks[0].column).toBe("in_progress");
   });
 
-  it("deduplicates actions, rejects stale agents, and expires leases through the alarm", async () => {
+  it("deduplicates actions, keeps ownership past the former lease, and requires explicit takeover", async () => {
     const stub = await freshBoard("idempotency");
     const actionId = crypto.randomUUID();
     const first = await command(stub, zac, 0, { type: "create_task", title: "Once", description: "Idempotent" }, { actionId });
@@ -325,16 +330,29 @@ describe("RepositoryBoard Durable Object", () => {
     expect(stale.ok).toBe(false);
     if (!stale.ok) expect(stale.error).toMatchObject({ code: "stale_revision", currentRevision: 1 });
 
-    unwrap(await command(stub, zac, 1, { type: "claim_task", taskId: view.tasks[0].id, kind: "planning", agentLabel: "Ephemeral" }));
+    const assigned = unwrap(await command(stub, zac, 1, { type: "claim_task", taskId: view.tasks[0].id, kind: "planning", agentLabel: "Persistent" }));
+    const assignmentId = assigned.tasks[0].assignment!.id;
     await runInDurableObject(stub, async (instance, state) => {
       state.storage.sql.exec("UPDATE assignments SET lease_expires_at = 0 WHERE status = 'active'");
       await instance.alarm();
     });
-    const expiredView = unwrap(await stub.getView(viewer(zac), false));
-    expect(expiredView.tasks[0].assignment).toBeNull();
-    expect(expiredView.revision).toBe(3);
-    const takeover = unwrap(await command(stub, ada, 3, { type: "claim_task", taskId: view.tasks[0].id, kind: "planning", agentLabel: "Takeover" }));
+    const persistentView = unwrap(await stub.getView(viewer(zac), false, client(zac).id));
+    expect(persistentView.tasks[0].assignment).toMatchObject({ id: assignmentId, agentLabel: "Persistent", isCurrentClient: true });
+    expect(persistentView.revision).toBe(2);
+    const competingClaim = await command(stub, ada, 2, { type: "claim_task", taskId: view.tasks[0].id, kind: "planning", agentLabel: "Competing claim" });
+    expect(competingClaim.ok).toBe(false);
+    if (!competingClaim.ok) expect(competingClaim.error.code).toBe("assignment_conflict");
+    const takeover = unwrap(await command(stub, ada, 2, {
+      type: "take_over_task",
+      taskId: view.tasks[0].id,
+      assignmentId,
+      agentLabel: "Takeover",
+      reason: "The original thread was abandoned",
+    }));
     expect(takeover.tasks[0].assignment).toMatchObject({ userLogin: "ada", agentLabel: "Takeover" });
+    const formerMutation = await command(stub, zac, 3, { type: "report_progress", assignmentId, phase: "planning", summary: "Still working", stats: {} });
+    expect(formerMutation.ok).toBe(false);
+    if (!formerMutation.ok) expect(formerMutation.error.code).toBe("assignment_inactive");
   });
 
   it("bounds retained webhook receipts", async () => {
@@ -360,6 +378,46 @@ describe("RepositoryBoard Durable Object", () => {
     if (!formerMutation.ok) expect(formerMutation.error.code).toBe("assignment_inactive");
   });
 
+  it("binds mutations to one tab capability and limits each tab to one assignment", async () => {
+    const stub = await freshBoard("tab-capability");
+    unwrap(await command(stub, zac, 0, { type: "create_task", title: "First", description: "Owned by one tab" }));
+    let view = unwrap(await command(stub, zac, 1, { type: "create_task", title: "Second", description: "Cannot share a tab" }));
+    const [firstTask, secondTask] = view.tasks;
+    view = unwrap(await command(stub, zac, 2, { type: "claim_task", taskId: firstTask.id, kind: "planning", agentLabel: "Primary tab" }));
+    const assignmentId = view.tasks[0].assignment!.id;
+
+    const otherTabMutation = await command(stub, zac, 3, {
+      type: "report_progress",
+      assignmentId,
+      phase: "planning",
+      summary: "Wrong tab",
+      stats: {},
+    }, { client: client(zac, "secondary") });
+    expect(otherTabMutation.ok).toBe(false);
+    if (!otherTabMutation.ok) expect(otherTabMutation.error.code).toBe("assignment_client_mismatch");
+
+    const secondClaim = await command(stub, zac, 3, { type: "claim_task", taskId: secondTask.id, kind: "planning", agentLabel: "Second task" });
+    expect(secondClaim.ok).toBe(false);
+    if (!secondClaim.ok) expect(secondClaim.error.code).toBe("client_already_assigned");
+
+    const secondTabClaim = unwrap(await command(stub, zac, 3, { type: "claim_task", taskId: secondTask.id, kind: "planning", agentLabel: "Secondary tab" }, { client: client(zac, "secondary") }));
+    expect(secondTabClaim.tasks[1].assignment).toMatchObject({ agentLabel: "Secondary tab", isMine: true, isCurrentClient: true });
+  });
+
+  it("keeps a reused browser-tab identity isolated across GitHub accounts", async () => {
+    const stub = await freshBoard("tab-account-isolation");
+    unwrap(await command(stub, zac, 0, { type: "create_task", title: "Zac task", description: "First account" }));
+    let view = unwrap(await command(stub, zac, 1, { type: "create_task", title: "Ada task", description: "Second account" }));
+    const sharedClient: ClientIdentity = { id: "shared-browser-tab", capabilityHash: "shared-capability" };
+
+    view = unwrap(await command(stub, zac, 2, { type: "claim_task", taskId: view.tasks[0].id, kind: "planning", agentLabel: "Zac tab" }, { client: sharedClient }));
+    const adaView = unwrap(await stub.getView(viewer(ada), false, sharedClient.id));
+    expect(adaView.tasks[0].assignment).toMatchObject({ isMine: false, isCurrentClient: false });
+
+    const adaClaim = unwrap(await command(stub, ada, 3, { type: "claim_task", taskId: view.tasks[1].id, kind: "planning", agentLabel: "Ada tab" }, { client: sharedClient }));
+    expect(adaClaim.tasks[1].assignment).toMatchObject({ userLogin: "ada", isMine: true, isCurrentClient: true });
+  });
+
   it("replays missed events and sends revisioned WebSocket updates", async () => {
     const stub = await freshBoard("websocket");
     unwrap(await command(stub, zac, 0, { type: "create_task", title: "First", description: "Before connect" }));
@@ -368,6 +426,7 @@ describe("RepositoryBoard Durable Object", () => {
         upgrade: "websocket",
         "x-board-viewer": JSON.stringify(viewer(zac)),
         "x-board-authorized-until": String(Date.now() + 60_000),
+        "x-board-client-id": client(zac).id,
       },
     }));
     expect(response.status).toBe(101);
@@ -387,23 +446,56 @@ describe("RepositoryBoard Durable Object", () => {
     expect(await closePromise).toMatchObject({ code: 1008, reason: "Client messages are not supported" });
   });
 
+  it("reports WebSocket presence without transferring assignment ownership", async () => {
+    const stub = await freshBoard("websocket-presence");
+    let view = unwrap(await command(stub, zac, 0, { type: "create_task", title: "Presence", description: "Keep ownership separate from connectivity" }));
+    view = unwrap(await command(stub, zac, 1, { type: "claim_task", taskId: view.tasks[0].id, kind: "planning", agentLabel: "Connected tab" }));
+    const assignmentId = view.tasks[0].assignment!.id;
+    const response = await stub.fetch(new Request("https://board.internal/socket?revision=2", {
+      headers: {
+        upgrade: "websocket",
+        "x-board-viewer": JSON.stringify(viewer(zac)),
+        "x-board-authorized-until": String(Date.now() + 60_000),
+        "x-board-client-id": client(zac).id,
+      },
+    }));
+    const socket = response.webSocket!;
+    const snapshotPromise = nextSocketMessage(socket);
+    socket.accept();
+    const snapshot = await snapshotPromise;
+    expect(snapshot.board.tasks[0].assignment).toMatchObject({
+      id: assignmentId,
+      connected: true,
+      isCurrentClient: true,
+    });
+
+    const otherTabView = unwrap(await stub.getView(viewer(zac), false, client(zac, "secondary").id));
+    expect(otherTabView.tasks[0].assignment).toMatchObject({
+      id: assignmentId,
+      connected: true,
+      isMine: true,
+      isCurrentClient: false,
+    });
+    expect(otherTabView.tasks[0].assignment?.lastSeenAt).not.toBeNull();
+  });
+
   it("recovers its SQLite state after eviction", async () => {
     const stub = await freshBoard("eviction");
     const before = unwrap(await command(stub, zac, 0, { type: "create_task", title: "Durable", description: "Survives eviction" }));
     await evictDurableObject(stub);
-    const recovered = unwrap(await stub.getView(viewer(zac), false));
+    const recovered = unwrap(await stub.getView(viewer(zac), false, client(zac).id));
     expect(recovered.tasks[0].reference).toBe(before.tasks[0].reference);
     expect(recovered).toMatchObject({ fullName: "acme/widgets", revision: 1 });
     expect(recovered.tasks[0].title).toBe("Durable");
   });
 });
 
-function nextSocketMessage(socket: WebSocket): Promise<{ type: string; revision: number; events: unknown[] }> {
+function nextSocketMessage(socket: WebSocket): Promise<BoardSocketMessage> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error("Timed out waiting for WebSocket message")), 2_000);
     socket.addEventListener("message", (event) => {
       clearTimeout(timeout);
-      resolve(JSON.parse(String(event.data)) as { type: string; revision: number; events: unknown[] });
+      resolve(JSON.parse(String(event.data)) as BoardSocketMessage);
     }, { once: true });
   });
 }

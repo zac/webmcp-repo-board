@@ -5,6 +5,7 @@ import {
   type Actor,
   type BoardSummary,
   type BoardView,
+  type ClientIdentity,
   type CommandEnvelope,
   type InternalBoardCommand,
   type RpcResult,
@@ -61,7 +62,7 @@ class RequestError extends Error {
     public readonly code: string,
     message: string,
     public readonly status: number,
-    public readonly details: { currentRevision?: number; ownerLogin?: string; leaseExpiresAt?: number } = {},
+    public readonly details: { currentRevision?: number; ownerLogin?: string; ownerAgentLabel?: string } = {},
   ) {
     super(message);
     this.name = "RequestError";
@@ -126,6 +127,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     const owner = decodeRepoPart(match[1]);
     const repo = decodeRepoPart(match[2]);
     const operation = match[3] ?? "view";
+    const clientId = optionalClientId(request);
     const board = await boardRecord(env, owner, repo);
     if (!board && operation === "view" && request.method === "GET") {
       return Response.json(await resolveDirectBoard(request, env, ctx, url, owner, repo));
@@ -144,7 +146,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     if (operation === "view" && request.method === "GET") {
       const includeArchived = url.searchParams.get("archived") === "1";
       if (includeArchived && !authorization.viewer.canMutate) throw new RequestError("forbidden", "Archived tasks require repository triage access", 403);
-      return Response.json(unwrap(await boardStub(env, board.id).getView(authorization.viewer, includeArchived)));
+      return Response.json(unwrap(await boardStub(env, board.id).getView(authorization.viewer, includeArchived, clientId)));
     }
     if (operation === "socket" && request.method === "GET") return connectSocket(request, env, board, authorization.viewer);
     if (operation === "commands" && request.method === "POST") {
@@ -155,7 +157,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     if (operation.startsWith("refresh/") && request.method === "POST") {
       assertSameOrigin(request, url);
       if (!authorization.viewer.canMutate || !authorization.user) throw new RequestError("forbidden", "Repository triage access is required", 403);
-      return refreshTask(env, board, authorization.viewer, decodeIdentifier(match[4]));
+      return refreshTask(request, env, board, authorization.viewer, decodeIdentifier(match[4]));
     }
   }
 
@@ -258,7 +260,7 @@ async function resolveDirectBoard(request: Request, env: Env, ctx: ExecutionCont
     const viewer = viewerFor(user, roleName, canMutateForRole(roleName));
     if (!viewer.canMutate) return virtualBoard(repository, viewer);
     const board = await materializeBoard(env, repository, 0, user);
-    return unwrap(await boardStub(env, board.id).getView(viewer, false));
+    return unwrap(await boardStub(env, board.id).getView(viewer, false, optionalClientId(request)));
   }
 
   if (isLocal(url)) {
@@ -266,7 +268,7 @@ async function resolveDirectBoard(request: Request, env: Env, ctx: ExecutionCont
     if (!user) return virtualBoard(repository, viewerFor(null, null, false));
     const viewer = viewerFor(user, "admin", true);
     const board = await materializeBoard(env, repository, 0, user);
-    return unwrap(await boardStub(env, board.id).getView(viewer, false));
+    return unwrap(await boardStub(env, board.id).getView(viewer, false, optionalClientId(request)));
   }
 
   if (!user) {
@@ -295,7 +297,7 @@ async function resolveDirectBoard(request: Request, env: Env, ctx: ExecutionCont
   const viewer = viewerFor(user, roleName, canMutateForRole(roleName));
   if (!viewer.canMutate) return virtualBoard(repository, viewer);
   const board = await materializeBoard(env, repository, installationId, user);
-  return unwrap(await boardStub(env, board.id).getView(viewer, false));
+  return unwrap(await boardStub(env, board.id).getView(viewer, false, optionalClientId(request)));
 }
 
 async function materializeBoard(env: Env, repository: GitHubRepository, installationId: number, user: AuthenticatedUser): Promise<BoardRecord> {
@@ -360,6 +362,7 @@ function repositoryUnavailable(): RequestError {
 
 async function executeCommand(request: Request, env: Env, board: BoardRecord, user: AuthenticatedUser, viewer: Viewer): Promise<Response> {
   const envelope = parseCommandEnvelope(await readJson(request));
+  const client = await requireClientIdentity(request);
   let internal: CommandEnvelope<InternalBoardCommand>;
   if (envelope.command.type === "link_pull_request") {
     const number = parsePullRequestUrl(envelope.command.url, board.owner, board.repo);
@@ -370,10 +373,10 @@ async function executeCommand(request: Request, env: Env, board: BoardRecord, us
     internal = envelope as CommandEnvelope<InternalBoardCommand>;
   }
   const actor: Actor = { userId: user.userId, login: user.login };
-  return Response.json(unwrap(await boardStub(env, board.id).execute(actor, viewer, internal, Date.now())));
+  return Response.json(unwrap(await boardStub(env, board.id).execute(actor, viewer, client, internal, Date.now())));
 }
 
-async function refreshTask(env: Env, board: BoardRecord, viewer: Viewer, taskId: string): Promise<Response> {
+async function refreshTask(request: Request, env: Env, board: BoardRecord, viewer: Viewer, taskId: string): Promise<Response> {
   const stub = boardStub(env, board.id);
   const linked = unwrap(await stub.reservePullRequestRefresh(taskId));
   const token = await installationToken(env, board.installation_id);
@@ -384,12 +387,13 @@ async function refreshTask(env: Env, board: BoardRecord, viewer: Viewer, taskId:
     await stub.recordPullRequestRefreshFailure(linked.taskId, linked.generation, Date.now());
     throw error;
   }
-  return Response.json(unwrap(await stub.getView(viewer, false)));
+  return Response.json(unwrap(await stub.getView(viewer, false, optionalClientId(request))));
 }
 
 async function connectSocket(request: Request, env: Env, board: BoardRecord, viewer: Viewer): Promise<Response> {
   if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") throw new RequestError("upgrade_required", "WebSocket upgrade is required", 426);
   const sourceUrl = new URL(request.url);
+  const clientId = clientIdentifier(sourceUrl.searchParams.get("client"), "WebSocket client ID");
   const internalUrl = new URL("https://board.internal/socket");
   internalUrl.searchParams.set("revision", sourceUrl.searchParams.get("revision") ?? "0");
   const internal = new Request(internalUrl, {
@@ -397,6 +401,7 @@ async function connectSocket(request: Request, env: Env, board: BoardRecord, vie
       upgrade: "websocket",
       "x-board-viewer": JSON.stringify(viewer),
       "x-board-authorized-until": String(Date.now() + 30_000),
+      "x-board-client-id": clientId,
     },
   });
   return boardStub(env, board.id).fetch(internal);
@@ -616,8 +621,29 @@ function unwrap<T>(result: RpcResult<T>): T {
   throw new RequestError(result.error.code, result.error.message, result.error.status, {
     currentRevision: result.error.currentRevision,
     ownerLogin: result.error.ownerLogin,
-    leaseExpiresAt: result.error.leaseExpiresAt,
+    ownerAgentLabel: result.error.ownerAgentLabel,
   });
+}
+
+function optionalClientId(request: Request): string | null {
+  const value = request.headers.get("x-repo-board-client-id");
+  return value === null ? null : clientIdentifier(value, "Client ID");
+}
+
+async function requireClientIdentity(request: Request): Promise<ClientIdentity> {
+  const id = clientIdentifier(request.headers.get("x-repo-board-client-id"), "Client ID");
+  const capability = request.headers.get("x-repo-board-client-capability");
+  if (!capability || !/^[a-f0-9]{64}$/.test(capability)) {
+    throw new RequestError("invalid_client_capability", "Client capability is missing or invalid", 400);
+  }
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(capability));
+  const capabilityHash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return { id, capabilityHash };
+}
+
+function clientIdentifier(value: string | null, name: string): string {
+  if (!value || !/^[A-Za-z0-9_-]{1,100}$/.test(value)) throw new RequestError("invalid_client_id", `${name} is invalid`, 400);
+  return value;
 }
 
 function decodeRepoPart(value: string): string {

@@ -10,13 +10,13 @@ Archiving is a terminal flag on Done tasks, not another column. Archived history
 
 ## What is implemented
 
-- Atomic 15-minute assignment leases in one SQLite-backed Durable Object per `owner/repo`
+- Durable per-tab assignments in one SQLite-backed Durable Object per `owner/repo`
 - Direct `/boards/:owner/:repo` routes with stateless blank previews for public repositories and lazy authenticated materialization
 - Revision-checked, idempotent task mutations and structured claim conflicts
 - Immutable ticket and delegated-plan revisions with an append-only activity log
 - Hibernating WebSockets with full snapshots, missed-event replay, and automatic reconnects
 - Dynamic `document.modelContext` tool profiles that are replaced as page context changes
-- Per-tab assignment pinning in `sessionStorage` with session-user ownership enforced in the Durable Object
+- Per-tab client IDs and bearer capabilities in `sessionStorage`, with capability hashes enforced in the Durable Object
 - Read-only GitHub App login, installation access, collaborator-role authorization, webhooks, and PR reconciliation
 - D1 limited to users, hashed sessions, installations, permission cache, and the repository-to-board directory
 - Normalized reviews, comments, checks, statuses, merge completion, and closed-unmerged rollback
@@ -35,7 +35,7 @@ Cloudflare Worker ─── GitHub App API + webhooks
         │
         ├── D1: identities, hashed sessions, installations, board directory
         │
-        └── RepositoryBoard Durable Object: tasks, plans, leases, PR snapshots, event log
+        └── RepositoryBoard Durable Object: tasks, plans, assignments, PR snapshots, event log
 ```
 
 GitHub calls finish in the Worker before a normalized snapshot is applied to the Durable Object. No serialized state path stays open across an external network request.
@@ -93,7 +93,7 @@ Any public GitHub repository route is anonymously readable. If no board exists, 
 
 The page always exposes `list_tasks` and `inspect_task`. An authorized unassigned page also exposes `claim_task`. Once the current tab pins an assignment, the registry switches to the tools legal for that ticket state. General read tools are reused; there is intentionally no parallel `read_task` tool.
 
-Every ticket has an immutable two-word reference such as `amber-fox`. The UUID remains an internal storage key. “Copy planning prompt” and “Copy implementation prompt” include the board URL and ticket reference, but do not reserve work. The first valid `claim_task` wins. Assigned tool calls renew the lease; an idle browser tab does not.
+Every ticket has an immutable two-word reference such as `amber-fox`. The UUID remains an internal storage key. “Copy planning prompt” and “Copy implementation prompt” include the board URL and ticket reference, but do not reserve work. The first valid `claim_task` wins. That assignment remains with its browser tab until release, workflow completion, cancellation, or a human-confirmed `take_over_task`. WebSocket presence is visible but never changes ownership.
 
 Ticket, plan, progress, review, and GitHub content is untrusted data. It is bounded in schemas and results and cannot select tools, authorize a mutation, choose a repository, or provide secrets.
 
@@ -104,7 +104,7 @@ pnpm check
 pnpm deploy:dry
 ```
 
-`pnpm check` runs ESLint, both TypeScript projects, Node tests, Miniflare Worker/Durable Object tests, and the production build. The Worker suite covers D1 routing, role authorization, session isolation, concurrent claims, idempotency, lease expiry and takeover, SQLite persistence across eviction, WebSocket replay, webhook verification, PR normalization, and the full workflow.
+`pnpm check` runs ESLint, both TypeScript projects, Node tests, Miniflare Worker/Durable Object tests, and the production build. The Worker suite covers D1 routing, role authorization, session and tab isolation, concurrent claims, idempotency, explicit takeover, SQLite persistence across eviction, WebSocket presence and replay, webhook verification, PR normalization, and the full workflow.
 
 ## Cloudflare Workers Builds
 

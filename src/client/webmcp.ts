@@ -43,6 +43,7 @@ export interface BoardToolHandlers {
   refreshPullRequest: (taskId: string, signal: AbortSignal) => Promise<BoardView>;
   confirmArchive: (task: TaskView, signal: AbortSignal) => Promise<void>;
   confirmCancel: (task: TaskView, suggestedReason: string, signal: AbortSignal) => Promise<string>;
+  confirmTakeover: (task: TaskView, agentLabel: string, reason: string, signal: AbortSignal) => Promise<{ agentLabel: string; reason: string }>;
 }
 
 export function activeModelContext(): WebMcpContext | null {
@@ -59,7 +60,7 @@ export async function registerBoardTools(context: WebMcpContext, handlers: Board
   const board = handlers.getBoard();
   const activeAssignmentId = handlers.getActiveAssignmentId();
   const assignedTask = activeAssignmentId
-    ? board.tasks.find((task) => task.assignment?.id === activeAssignmentId && task.assignment.isMine) ?? null
+    ? board.tasks.find((task) => task.assignment?.id === activeAssignmentId && task.assignment.isCurrentClient) ?? null
     : null;
 
   await add({
@@ -89,16 +90,11 @@ export async function registerBoardTools(context: WebMcpContext, handlers: Board
         taskId: { type: "string", minLength: 1, maxLength: 100, description: "Legacy internal UUID. Prefer taskRef." },
       },
     },
-    annotations: { readOnlyHint: !assignedTask?.assignment, destructiveHint: false, untrustedContentHint: true },
+    annotations: { readOnlyHint: true, destructiveHint: false, untrustedContentHint: true },
     execute: async (input, execution) => {
       const requested = typeof input.taskRef === "string" ? input.taskRef : typeof input.taskId === "string" ? input.taskId : null;
       const combined = toolSignal(execution, signal);
-      let inspected = await inspectTask(handlers, requested, combined);
-      if (assignedTask?.assignment && "id" in inspected && inspected.id === assignedTask.id) {
-        await handlers.runCommand({ type: "renew_assignment", assignmentId: assignedTask.assignment.id }, combined);
-        inspected = await inspectTask(handlers, requested, combined);
-      }
-      return bounded(inspected);
+      return bounded(await inspectTask(handlers, requested, combined));
     },
   });
 
@@ -155,14 +151,43 @@ export async function registerBoardTools(context: WebMcpContext, handlers: Board
     });
   }
 
+  if (board.viewer.canMutate && !assignedTask && selected?.assignment && !selected.assignment.isCurrentClient) {
+    await add({
+      name: "take_over_task",
+      title: "Take over the selected assignment",
+      description: "Use only when the human explicitly asks this thread to replace the current task owner. The page shows the current owner and presence, then requires human confirmation. A confirmed takeover creates a new durable assignment for this browser tab and immediately fences the former owner out of board mutations.",
+      inputSchema: {
+        type: "object", additionalProperties: false,
+        properties: {
+          agentLabel: { type: "string", minLength: 1, maxLength: 80, description: "A short label for this thread or agent." },
+          reason: { type: "string", minLength: 1, maxLength: 500, description: "Why the current assignment must move to this thread." },
+        },
+        required: ["agentLabel", "reason"],
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, untrustedContentHint: true },
+      execute: async (input, execution) => {
+        const combined = toolSignal(execution, signal);
+        const confirmed = await handlers.confirmTakeover(selected, String(input.agentLabel), String(input.reason), combined);
+        const next = await handlers.runCommand({
+          type: "take_over_task",
+          taskId: selected.id,
+          assignmentId: selected.assignment!.id,
+          ...confirmed,
+        }, combined);
+        const task = next.tasks.find((candidate) => candidate.id === selected.id);
+        return bounded({ status: "taken_over", revision: next.revision, task: task ? taskSummary(task) : null, assignment: task?.assignment ?? null });
+      },
+    });
+  }
+
   if (assignedTask?.assignment) {
     await addAssignmentTools(add, handlers, assignedTask, signal);
     return names;
   }
 
   if (selected?.column === "in_pr" && selected.pullRequest) {
-    await add(readPullRequestTool(selected, handlers, signal));
-    await add(readReviewTool(selected, handlers, signal));
+    await add(readPullRequestTool(selected, handlers));
+    await add(readReviewTool(selected, handlers));
     if (board.viewer.canMutate) await add(checkStatusTool(selected, handlers, signal));
   }
 
@@ -170,7 +195,7 @@ export async function registerBoardTools(context: WebMcpContext, handlers: Board
     await add({
       name: "claim_task",
       title: "Claim a task to plan or implement",
-      description: "Call this first when the user asks to plan, groom, implement, address feedback, fix checks, or prepare to merge an existing task. If the user names a task by title, call list_tasks to find its taskRef. For a Todo task, use kind \"planning\". A successful claim activates set_plan and set_plan_and_start_work. For Ready, In Progress, or In PR work, use kind \"implementation\". The first valid claim receives a renewable 15-minute write lease.",
+      description: "Call this first when the user asks to plan, groom, implement, address feedback, fix checks, or prepare to merge an unassigned task. If the user names a task by title, call list_tasks to find its taskRef. For a Todo task, use kind \"planning\". A successful claim activates set_plan and set_plan_and_start_work. For Ready, In Progress, or In PR work, use kind \"implementation\". Ownership stays with this browser tab until it releases, completes, or a human explicitly confirms a takeover.",
       inputSchema: {
         type: "object", additionalProperties: false,
         properties: {
@@ -203,8 +228,9 @@ export async function registerBoardTools(context: WebMcpContext, handlers: Board
               status: "assignment_conflict",
               message: caught.message,
               ownerLogin: caught.details.ownerLogin ?? null,
-              leaseExpiresAt: caught.details.leaseExpiresAt ?? null,
+              ownerAgentLabel: caught.details.ownerAgentLabel ?? null,
               currentRevision: caught.details.currentRevision ?? null,
+              next: "Do not begin work. Select the assigned task and use take_over_task only if the human explicitly asks to replace its current owner.",
             });
           }
           throw caught;
@@ -257,7 +283,7 @@ async function addAssignmentTools(
   await add({
     name: "report_progress",
     title: "Report agent progress",
-    description: "Renew this tab's assignment lease and post a bounded, explicitly self-reported status. Do not report native Codex telemetry that the page cannot verify.",
+    description: "Post a bounded, explicitly self-reported status for this tab's durable assignment. Do not report native Codex telemetry that the page cannot verify.",
     inputSchema: {
       type: "object", additionalProperties: false,
       properties: {
@@ -319,7 +345,7 @@ async function addAssignmentTools(
   }
 
   if (task.column === "ready" && assignment.kind === "implementation") {
-    await add(readPlanTool(task, handlers, registrySignal));
+    await add(readPlanTool(task, handlers));
     await add({
       name: "update_plan",
       title: "Revise the delegated plan",
@@ -331,7 +357,7 @@ async function addAssignmentTools(
     await add({
       name: "start_work",
       title: "Move this task into progress",
-      description: "Accept the current delegated plan, renew this assignment, and move the task from Ready to In Progress.",
+      description: "Accept the current delegated plan and move the durably assigned task from Ready to In Progress.",
       inputSchema: emptySchema(),
       annotations: { readOnlyHint: false, destructiveHint: false, untrustedContentHint: false },
       execute: async (_input, execution) => bounded({ status: "in_progress", revision: (await handlers.runCommand({ type: "start_work", assignmentId }, toolSignal(execution, registrySignal))).revision }),
@@ -339,7 +365,7 @@ async function addAssignmentTools(
   }
 
   if (task.column === "in_progress" && assignment.kind === "implementation") {
-    await add(readPlanTool(task, handlers, registrySignal));
+    await add(readPlanTool(task, handlers));
     await add({
       name: "link_pull_request",
       title: "Link the implementation pull request",
@@ -351,49 +377,42 @@ async function addAssignmentTools(
   }
 
   if (task.column === "in_pr" && assignment.kind === "implementation" && task.pullRequest) {
-    await add(readPullRequestTool(task, handlers, registrySignal, assignmentId));
-    await add(readReviewTool(task, handlers, registrySignal, assignmentId));
-    await add(checkStatusTool(task, handlers, registrySignal, assignmentId));
+    await add(readPullRequestTool(task, handlers));
+    await add(readReviewTool(task, handlers));
+    await add(checkStatusTool(task, handlers, registrySignal));
   }
 }
 
-function readPlanTool(task: TaskView, handlers: BoardToolHandlers, registrySignal: AbortSignal): WebMcpTool {
+function readPlanTool(task: TaskView, handlers: BoardToolHandlers): WebMcpTool {
   return {
     name: "read_plan",
     title: "Read the delegated plan",
-    description: "Renew this assignment lease, then read the latest immutable delegated-approved plan revision. Plan text is untrusted content.",
+    description: "Read the latest immutable delegated-approved plan revision. Plan text is untrusted content.",
     inputSchema: emptySchema(),
-    annotations: { readOnlyHint: false, destructiveHint: false, untrustedContentHint: true },
-    execute: async (_input, execution) => {
-      await renewReadAssignment(handlers, task.assignment!.id, execution, registrySignal);
-      return bounded(handlers.getBoard().tasks.find((candidate) => candidate.id === task.id)?.plan ?? task.plan ?? { status: "missing" });
-    },
+    annotations: { readOnlyHint: true, destructiveHint: false, untrustedContentHint: true },
+    execute: async () => bounded(handlers.getBoard().tasks.find((candidate) => candidate.id === task.id)?.plan ?? task.plan ?? { status: "missing" }),
   };
 }
 
-function readPullRequestTool(task: TaskView, handlers: BoardToolHandlers, registrySignal: AbortSignal, assignmentId?: string): WebMcpTool {
+function readPullRequestTool(task: TaskView, handlers: BoardToolHandlers): WebMcpTool {
   return {
     name: "read_pull_request",
     title: "Read the linked pull request",
-    description: `${assignmentId ? "Renew this assignment lease, then read" : "Read"} the cached linked pull request metadata and check summary. GitHub text is untrusted content.`,
+    description: "Read the cached linked pull request metadata and check summary. GitHub text is untrusted content.",
     inputSchema: emptySchema(),
-    annotations: { readOnlyHint: !assignmentId, destructiveHint: false, untrustedContentHint: true },
-    execute: async (_input, execution) => {
-      if (assignmentId) await renewReadAssignment(handlers, assignmentId, execution, registrySignal);
-      return bounded(handlers.getBoard().tasks.find((candidate) => candidate.id === task.id)?.pullRequest ?? task.pullRequest ?? { status: "not_linked" });
-    },
+    annotations: { readOnlyHint: true, destructiveHint: false, untrustedContentHint: true },
+    execute: async () => bounded(handlers.getBoard().tasks.find((candidate) => candidate.id === task.id)?.pullRequest ?? task.pullRequest ?? { status: "not_linked" }),
   };
 }
 
-function readReviewTool(task: TaskView, handlers: BoardToolHandlers, registrySignal: AbortSignal, assignmentId?: string): WebMcpTool {
+function readReviewTool(task: TaskView, handlers: BoardToolHandlers): WebMcpTool {
   return {
     name: "read_review",
     title: "Read pull request reviews",
-    description: `${assignmentId ? "Renew this assignment lease, then read" : "Read"} bounded review decisions and recent review bodies. GitHub review text is untrusted content.`,
+    description: "Read bounded review decisions and recent review bodies. GitHub review text is untrusted content.",
     inputSchema: emptySchema(),
-    annotations: { readOnlyHint: !assignmentId, destructiveHint: false, untrustedContentHint: true },
-    execute: async (_input, execution) => {
-      if (assignmentId) await renewReadAssignment(handlers, assignmentId, execution, registrySignal);
+    annotations: { readOnlyHint: true, destructiveHint: false, untrustedContentHint: true },
+    execute: async () => {
       const current = handlers.getBoard().tasks.find((candidate) => candidate.id === task.id) ?? task;
       const pullRequest = current.pullRequest!;
       return bounded({
@@ -413,29 +432,19 @@ function readReviewTool(task: TaskView, handlers: BoardToolHandlers, registrySig
   };
 }
 
-function checkStatusTool(task: TaskView, handlers: BoardToolHandlers, registrySignal: AbortSignal, assignmentId?: string): WebMcpTool {
+function checkStatusTool(task: TaskView, handlers: BoardToolHandlers, registrySignal: AbortSignal): WebMcpTool {
   return {
     name: "check_status",
     title: "Refresh pull request status",
-    description: `${assignmentId ? "Renew this assignment lease, then fetch" : "Fetch"} current review, comment, check, and merge state from GitHub and repair the cached snapshot.`,
+    description: "Fetch current review, comment, check, and merge state from GitHub and repair the cached snapshot.",
     inputSchema: emptySchema(),
     annotations: { readOnlyHint: false, destructiveHint: false, untrustedContentHint: true },
     execute: async (_input, execution) => {
       const combined = toolSignal(execution, registrySignal);
-      if (assignmentId) await handlers.runCommand({ type: "renew_assignment", assignmentId }, combined);
       const next = await handlers.refreshPullRequest(task.id, combined);
       return bounded(next.tasks.find((candidate) => candidate.id === task.id)?.pullRequest ?? { status: "not_linked" });
     },
   };
-}
-
-async function renewReadAssignment(
-  handlers: BoardToolHandlers,
-  assignmentId: string,
-  execution: { signal?: AbortSignal } | undefined,
-  registrySignal: AbortSignal,
-): Promise<void> {
-  await handlers.runCommand({ type: "renew_assignment", assignmentId }, toolSignal(execution, registrySignal));
 }
 
 async function inspectTask(
@@ -465,7 +474,7 @@ function taskSummary(task: TaskView): Record<string, unknown> {
     resolutionReason: task.resolutionReason,
     archivedAt: task.archivedAt,
     planRevision: task.plan?.revision ?? null,
-    assignment: task.assignment ? { user: task.assignment.userLogin, agentLabel: task.assignment.agentLabel, focus: task.assignment.focus, phase: task.assignment.phase, summary: task.assignment.summary, leaseExpiresAt: task.assignment.leaseExpiresAt } : null,
+    assignment: task.assignment ? { user: task.assignment.userLogin, agentLabel: task.assignment.agentLabel, focus: task.assignment.focus, phase: task.assignment.phase, summary: task.assignment.summary, connected: task.assignment.connected, lastSeenAt: task.assignment.lastSeenAt } : null,
     pullRequest: task.pullRequest ? { number: task.pullRequest.number, authorLogin: task.pullRequest.authorLogin, state: task.pullRequest.state, merged: task.pullRequest.merged, approvals: task.pullRequest.approvals, reviewRequirement: task.pullRequest.reviewRequirement, mergeState: task.pullRequest.mergeState, changesRequested: task.pullRequest.changesRequestedBy.length, requestedReviewers: task.pullRequest.requestedReviewers, checks: task.pullRequest.checks } : null,
   };
 }

@@ -20,13 +20,13 @@ Every GitHub repository has a stable entry route at `/boards/:owner/:repo`. A pu
 - Humans can enter any `owner/repo` from the landing page or navigate directly to `/boards/:owner/:repo`; an explicit board-creation flow is not required.
 - Humans create and edit Todo tickets in the UI. Each ticket has an immutable repository-local two-word reference, a title, Markdown description, revision history, activity log, and optional linked PR. UUIDs remain internal storage keys.
 - “Plan with Codex” copies a prompt containing the board URL and ticket reference. “Implement with Codex” does the same for Ready or stale work.
-- Copying does not reserve the ticket. The first authorized agent to call `claim_task` receives the assignment. A simultaneous caller gets a structured conflict with the current owner and lease expiry.
+- Copying does not reserve the ticket. The first authorized agent to call `claim_task` receives a durable assignment bound to that browser tab. A simultaneous caller gets a structured conflict naming the current owner.
 - Planning is delegated approval: the human’s choice to start a planning task authorizes its agent to call `set_plan`. Submission creates an immutable plan revision, moves Todo to Ready, and closes the planning assignment.
 - A Ready assignment remains in Ready while the agent reads or updates the plan. `update_plan` creates another delegated-approved revision. `start_work` moves it to In Progress.
 - Linking a valid open PR from the same repository moves the task to In PR. Merge moves it automatically to Done. Closing without merge returns it to In Progress.
 - Done tickets can be archived through the UI or an `archive_task` tool that waits for explicit in-page confirmation.
 
-Assignments use renewable 15-minute leases. Assignment tool calls renew the lease; an open browser tab alone does not. Expired work remains in its current column but becomes claimable for takeover. Every mutation includes an idempotency key and expected board revision, so a stale agent immediately learns that ownership or state changed.
+Assignments do not expire on a timer. Each browser tab generates a random local client ID and bearer capability that the page attaches to commands without exposing either as WebMCP parameters or tool results. The Durable Object binds the assignment to the authenticated GitHub user, client ID, and hashed capability. WebSocket presence reports whether the owning tab is connected, but presence never grants or revokes ownership. Work remains assigned until release, workflow completion, cancellation, or a human-confirmed `take_over_task` action. Takeover creates a new assignment and immediately fences the former tab out of board mutations. Every mutation also includes an idempotency key and expected board revision.
 
 ## Technical architecture and interfaces
 
@@ -37,7 +37,7 @@ Assignments use renewable 15-minute leases. Assignment tool calls renew the leas
 - D1 stores only global data: GitHub identities, hashed web sessions, installations, and the `owner/repo → boardId` directory for materialized boards. Public previews are cached briefly at the edge and do not create database state.
 - Accepted commands update Durable Object SQLite atomically, increment the board revision, and then broadcast a revisioned update through hibernating WebSockets.
 - Reconnecting clients send their last revision and receive either missed events or a full snapshot.
-- One Durable Object alarm tracks the earliest due item across lease expiries and the next PR reconciliation poll. Reconciliation polling is the correctness path — it repairs any missed, delayed, or misordered webhook — so webhooks only reduce latency. A useful consequence: local development works end to end with no public webhook endpoint.
+- One Durable Object alarm tracks the next PR reconciliation poll and WebSocket authorization refresh. Reconciliation polling is the correctness path. It repairs any missed, delayed, or misordered webhook, so webhooks only reduce latency. Local development therefore works end to end with no public webhook endpoint.
 - GitHub API calls happen in the Worker before applying a normalized snapshot to the Durable Object. The object never holds its serialized state path open across external network calls.
 
 Core types:
@@ -60,7 +60,7 @@ interface CommandEnvelope<T> {
 }
 ```
 
-Self-reported agent telemetry includes phase, claimed time, last activity, lease expiry, latest bounded summary, and optional counts for files changed, commits, passing tests, and failing tests. The UI labels these values as agent-reported. Native Codex task IDs, token usage, message counts, and task APIs are explicitly excluded.
+Self-reported agent telemetry includes phase, claimed time, last activity, latest bounded summary, and optional counts for files changed, commits, passing tests, and failing tests. Separately, browser presence includes connected state and the last observed connection time. The UI labels agent telemetry as agent-reported. Native Codex task IDs, token usage, message counts, and task APIs are explicitly excluded.
 
 ### Dynamic WebMCP profiles
 
@@ -70,13 +70,14 @@ Register tools through `document.modelContext`, with one `AbortController` per a
 |---|---|
 | Anonymous or read-only | `list_tasks`, `inspect_task` |
 | Authorized, unassigned | read tools plus `claim_task` |
+| Selected task assigned to another tab | read tools plus confirmed `take_over_task` |
 | Assigned Todo | read tools plus `report_progress`, `set_plan`, `release_task` |
 | Assigned Ready | read tools plus `read_plan`, `update_plan`, `report_progress`, `start_work`, `release_task` |
 | Assigned In Progress | read tools plus `read_plan`, `report_progress`, `link_pull_request`, `release_task` |
 | Assigned In PR | read tools plus `read_pull_request`, `read_review`, `check_status`, `report_progress`, `release_task` |
 | Selected Done task | read tools plus confirmed `archive_task` |
 
-`list_tasks` and `inspect_task` are the only general read tools; assigned profiles reuse them rather than registering a parallel `read_task`. For an assigned agent, `inspect_task` additionally includes its own assignment, lease expiry, and latest progress report.
+`list_tasks` and `inspect_task` are the only general read tools; assigned profiles reuse them rather than registering a parallel `read_task`. For an assigned agent, `inspect_task` additionally includes its own assignment, browser presence, and latest progress report.
 
 Ticket, plan, progress, and GitHub text is untrusted content. Tool descriptions and bounded results state this explicitly. User-authored text never selects tools, changes authorization, chooses network destinations, or supplies secrets.
 
@@ -94,18 +95,18 @@ Use one read-only GitHub App for login, repository installation, API access, and
 - Cache authorization briefly, at most 60 seconds, and fail closed when GitHub cannot verify private access.
 - Store the App ID, private key, webhook secret, and OAuth client secret as Worker secrets via `wrangler secret put`. Production registers the deployed callback and webhook URLs; local development leans on reconciliation polling instead of forwarded webhooks.
 
-Session and assignment identity differ from Card Table on purpose. Card Table needed seat-scoped cookies because seats were anonymous bearer credentials; Repo Board has real authenticated users, so assignment ownership is a database fact, not a cookie. One `HttpOnly`, `Secure`, `SameSite` session cookie identifies the GitHub user across every tab in the browser. Each tab pins its active ticket and assignment ID in `sessionStorage`, every mutating command carries that assignment ID, and the Durable Object verifies the assignment belongs to the session's user before applying it. Two Codex threads sharing one cookie jar can therefore hold different assignments concurrently without clobbering each other's credentials.
+Session and assignment identity differ from Card Table on purpose. One `HttpOnly`, `Secure`, `SameSite` session cookie identifies the GitHub user across every tab. Each tab also creates a random client ID and bearer capability in `sessionStorage`. The Worker hashes the capability before sending it to the Durable Object. Assignment mutations must match the GitHub user, client ID, and capability hash. The corresponding WebSocket carries only the client ID for presence. Two Codex threads sharing one GitHub session can therefore hold different assignments without gaining access to each other's commands. If work must move, `take_over_task` waits for in-page human confirmation and rotates ownership to the requesting tab.
 
 A normalized PR snapshot contains PR number, URL, draft/open/closed/merged state, head SHA, approvals, current changes-requested reviewers, review-comment count, conversation-comment count, check totals, failed/pending check names, and last synchronization time. `read_review` returns bounded recent review details; `check_status` performs a live refresh and repairs missed webhook state.
 
 ## Verification and delivery
 
 - Reducer tests cover every legal transition and reject skipped columns, wrong assignment kinds, stale revisions, cross-repository PRs, closed PR linking, and invalid archival.
-- Concurrency tests issue simultaneous claims and prove exactly one succeeds. Cover duplicate actions, expiry, takeover, stale-agent mutations, release, and planner completion.
+- Concurrency tests issue simultaneous claims and prove exactly one succeeds. Cover duplicate actions, durable ownership, explicit takeover, tab capability isolation, stale-agent mutations, release, and planner completion.
 - Authorization tests cover anonymous public reads, stateless public previews, indistinguishable private/missing routes, lazy materialization, each GitHub role including `triage` via `role_name`, session isolation, revoked access, CSRF state, safe OAuth return paths, and two tabs of one session holding different assignments without interference.
 - WebMCP tests assert the exact registry for every context, two-word reference lookup, profile cleanup, duplicate-name prevention, bounded schemas/results, cancellation, confirmation, and UI/tool parity.
 - GitHub tests verify webhook signatures and deduplication, review/check normalization, delayed-event ordering, manual refresh, merge-to-Done, and closed-unmerged rollback.
-- Worker tests cover Durable Object eviction, persistence, WebSocket replay/resynchronization, alarm-driven lease expiry, and D1 board lookup.
+- Worker tests cover Durable Object eviction, persistent assignments, WebSocket presence and replay, PR reconciliation alarms, and D1 board lookup.
 - Browser acceptance demonstrates two agents racing for one task, a planning handoff, dynamic tool replacement, Ready-to-work transition, live progress, PR linkage, review changes, checks, merge, and archival.
 
 Build in five focused slices: scaffold and state model; board UI plus real-time claims; dynamic WebMCP and copied prompts; GitHub App and PR synchronization; adversarial tests, polish, deployment, and the under-three-minute demo.

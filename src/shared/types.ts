@@ -38,11 +38,13 @@ export interface AssignmentView {
   agentLabel: string;
   claimedAt: number;
   lastActivityAt: number;
-  leaseExpiresAt: number;
+  lastSeenAt: number | null;
+  connected: boolean;
   phase: AgentPhase;
   summary: string;
   stats: AgentStats;
   isMine: boolean;
+  isCurrentClient: boolean;
 }
 
 export interface PlanRevision {
@@ -178,7 +180,7 @@ export type BoardCommand =
   | { type: "create_task"; title: string; description: string }
   | { type: "edit_task"; taskId: string; title: string; description: string }
   | { type: "claim_task"; taskId: string; kind: AssignmentKind; focus?: AssignmentFocus; agentLabel: string }
-  | { type: "renew_assignment"; assignmentId: string }
+  | { type: "take_over_task"; taskId: string; assignmentId: string; agentLabel: string; reason: string }
   | { type: "report_progress"; assignmentId: string; phase: AgentPhase; summary: string; stats: AgentStats }
   | { type: "set_plan"; assignmentId: string; markdown: string }
   | { type: "set_plan_and_start_work"; assignmentId: string; markdown: string }
@@ -197,13 +199,18 @@ export interface Actor {
   login: string;
 }
 
+export interface ClientIdentity {
+  id: string;
+  capabilityHash: string;
+}
+
 export type RpcResult<T> = { ok: true; value: T } | { ok: false; error: {
   code: string;
   message: string;
   status: number;
   currentRevision?: number;
   ownerLogin?: string;
-  leaseExpiresAt?: number;
+  ownerAgentLabel?: string;
 } };
 
 export interface BoardSocketMessage {

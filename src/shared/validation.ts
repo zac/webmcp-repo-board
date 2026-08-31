@@ -31,6 +31,15 @@ export function parseCommandEnvelope(value: unknown): CommandEnvelope {
         agentLabel: boundedString(commandObject.agentLabel, "agentLabel", 1, 80),
       };
       break;
+    case "take_over_task":
+      command = {
+        type,
+        taskId: identifier(commandObject.taskId, "taskId"),
+        assignmentId: identifier(commandObject.assignmentId, "assignmentId"),
+        agentLabel: boundedString(commandObject.agentLabel, "agentLabel", 1, 80),
+        reason: boundedString(commandObject.reason, "reason", 1, 500),
+      };
+      break;
     case "report_progress":
       command = { type, assignmentId: identifier(commandObject.assignmentId, "assignmentId"), phase: enumValue(commandObject.phase, AGENT_PHASES, "phase"), summary: boundedString(commandObject.summary, "summary", 1, 500), stats: parseStats(commandObject.stats) };
       break;
@@ -40,7 +49,6 @@ export function parseCommandEnvelope(value: unknown): CommandEnvelope {
       command = { type, assignmentId: identifier(commandObject.assignmentId, "assignmentId"), markdown: boundedString(commandObject.markdown, "markdown", 1, 20_000) };
       break;
     case "start_work":
-    case "renew_assignment":
     case "release_task":
       command = { type, assignmentId: identifier(commandObject.assignmentId, "assignmentId") };
       break;

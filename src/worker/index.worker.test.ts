@@ -27,7 +27,18 @@ async function seedBoard(repo: string, isPrivate: boolean): Promise<void> {
 }
 
 function authenticated(role: string, userId = "user-zac", login = "zac", init: RequestInit = {}): RequestInit {
-  return { ...init, headers: { ...Object.fromEntries(new Headers(init.headers)), "x-test-user-id": userId, "x-test-user-login": login, "x-test-role": role } };
+  return { ...init, headers: {
+    ...Object.fromEntries(new Headers(init.headers)),
+    "x-test-user-id": userId,
+    "x-test-user-login": login,
+    "x-test-role": role,
+    "x-repo-board-client-id": "test-client",
+    "x-repo-board-client-capability": "a".repeat(64),
+  } };
+}
+
+function asTab(init: RequestInit, clientId: string): RequestInit {
+  return { ...init, headers: { ...Object.fromEntries(new Headers(init.headers)), "x-repo-board-client-id": clientId } };
 }
 
 describe("Worker authorization and directory routing", () => {
@@ -139,7 +150,7 @@ describe("Worker authorization and directory routing", () => {
       taskIds.push(board.tasks.find((task) => task.title === title)!.id);
     }
     for (const [index, taskId] of taskIds.entries()) {
-      const response = await SELF.fetch(`${url}/commands`, { ...headers, body: JSON.stringify({ actionId: crypto.randomUUID(), expectedRevision: revision, command: { type: "claim_task", taskId, kind: "planning", agentLabel: `Tab ${index + 1}` } }) });
+      const response = await SELF.fetch(`${url}/commands`, { ...asTab(headers, `tab-${index + 1}`), body: JSON.stringify({ actionId: crypto.randomUUID(), expectedRevision: revision, command: { type: "claim_task", taskId, kind: "planning", agentLabel: `Tab ${index + 1}` } }) });
       const board = await response.json() as BoardView;
       revision = board.revision;
     }
@@ -181,9 +192,9 @@ describe("Worker authorization and directory routing", () => {
     expect(conflict).toMatchObject({
       error: "assignment_conflict",
       ownerLogin: "zac",
+      ownerAgentLabel: expect.stringMatching(/Primary|Secondary/),
       currentRevision: 2,
     });
-    expect(Number(conflict.leaseExpiresAt)).toBeGreaterThan(Date.now());
   });
 });
 

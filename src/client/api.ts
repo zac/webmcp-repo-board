@@ -18,7 +18,7 @@ export class ApiError extends Error {
     public readonly code: string,
     message: string,
     public readonly status: number,
-    public readonly details: { currentRevision?: number; ownerLogin?: string; leaseExpiresAt?: number } = {},
+    public readonly details: { currentRevision?: number; ownerLogin?: string; ownerAgentLabel?: string } = {},
   ) {
     super(message);
     this.name = "ApiError";
@@ -73,11 +73,15 @@ export function boardSocketUrl(board: BoardView): string {
   const url = new URL(`/api/boards/${encodeURIComponent(board.owner)}/${encodeURIComponent(board.repo)}/socket`, window.location.href);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   url.searchParams.set("revision", String(board.revision));
+  url.searchParams.set("client", boardClientIdentity().id);
   return url.toString();
 }
 
 async function request<T>(path: string, init: RequestInit): Promise<T> {
   const headers = new Headers(init.headers);
+  const client = boardClientIdentity();
+  headers.set("x-repo-board-client-id", client.id);
+  headers.set("x-repo-board-client-capability", client.capability);
   if (init.body) headers.set("content-type", "application/json");
   const response = await fetch(path, { ...init, headers, credentials: "same-origin" });
   if (!response.ok) {
@@ -89,12 +93,30 @@ async function request<T>(path: string, init: RequestInit): Promise<T> {
       {
         ...(Number.isSafeInteger(body.currentRevision) ? { currentRevision: Number(body.currentRevision) } : {}),
         ...(typeof body.ownerLogin === "string" ? { ownerLogin: body.ownerLogin } : {}),
-        ...(Number.isSafeInteger(body.leaseExpiresAt) ? { leaseExpiresAt: Number(body.leaseExpiresAt) } : {}),
+        ...(typeof body.ownerAgentLabel === "string" ? { ownerAgentLabel: body.ownerAgentLabel } : {}),
       },
     );
   }
   if (response.status === 204) return undefined as T;
   return await response.json() as T;
+}
+
+const CLIENT_ID_KEY = "repo-board:client-id";
+const CLIENT_CAPABILITY_KEY = "repo-board:client-capability";
+
+export function boardClientIdentity(): { id: string; capability: string } {
+  let id = sessionStorage.getItem(CLIENT_ID_KEY);
+  let capability = sessionStorage.getItem(CLIENT_CAPABILITY_KEY);
+  if (!id) {
+    id = crypto.randomUUID();
+    sessionStorage.setItem(CLIENT_ID_KEY, id);
+  }
+  if (!capability) {
+    const bytes = crypto.getRandomValues(new Uint8Array(32));
+    capability = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    sessionStorage.setItem(CLIENT_CAPABILITY_KEY, capability);
+  }
+  return { id, capability };
 }
 
 async function safeJson(response: Response): Promise<Record<string, unknown>> {

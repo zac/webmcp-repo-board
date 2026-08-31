@@ -67,11 +67,13 @@ function task(column: TaskColumn, assigned = false): TaskView {
       agentLabel: "Codex",
       claimedAt: 2,
       lastActivityAt: 3,
-      leaseExpiresAt: Date.now() + 60_000,
+      lastSeenAt: 3,
+      connected: true,
       phase: column === "todo" ? "planning" : "implementing",
       summary: "Working",
       stats: {},
       isMine: true,
+      isCurrentClient: true,
     } : null,
     pullRequest: column === "in_pr" || column === "done" ? pullRequest() : null,
     recentEvents: [],
@@ -104,6 +106,7 @@ function handlers(boardValue: BoardView, selected: string | null = boardValue.ta
     refreshPullRequest: vi.fn(async () => boardValue),
     confirmArchive: vi.fn(async () => undefined),
     confirmCancel: vi.fn(async (_task, reason) => reason),
+    confirmTakeover: vi.fn(async (_task, agentLabel, reason) => ({ agentLabel, reason })),
   };
 }
 
@@ -176,7 +179,7 @@ describe("dynamic WebMCP profiles", () => {
     toolHandlers.runCommand = vi.fn(async () => {
       throw new ApiError("assignment_conflict", "zac owns this task", 409, {
         ownerLogin: "zac",
-        leaseExpiresAt: 123_456,
+        ownerAgentLabel: "Primary",
         currentRevision: 4,
       });
     });
@@ -192,12 +195,13 @@ describe("dynamic WebMCP profiles", () => {
       status: "assignment_conflict",
       message: "zac owns this task",
       ownerLogin: "zac",
-      leaseExpiresAt: 123_456,
+      ownerAgentLabel: "Primary",
       currentRevision: 4,
+      next: "Do not begin work. Select the assigned task and use take_over_task only if the human explicitly asks to replace its current owner.",
     });
   });
 
-  it("exposes reviewer-safe PR tools without taking the implementation lease", async () => {
+  it("exposes reviewer-safe PR tools without taking the implementation assignment", async () => {
     const boardValue = board(task("in_pr"), false);
     const registry = new Registry();
     const toolHandlers = handlers(boardValue);
@@ -251,6 +255,27 @@ describe("dynamic WebMCP profiles", () => {
       { type: "cancel_task", taskId: "task-in_progress", reason: "Superseded by a smaller change" },
       expect.any(AbortSignal),
     );
+  });
+
+  it("requires human confirmation before taking an assignment from another tab", async () => {
+    const registry = new Registry();
+    const assigned = task("in_progress", true);
+    assigned.assignment = { ...assigned.assignment!, connected: true, isCurrentClient: false };
+    const boardValue = board(assigned);
+    const toolHandlers = handlers(boardValue);
+    await registerBoardTools(registry, toolHandlers, new AbortController().signal);
+
+    expect([...registry.tools.keys()]).toContain("take_over_task");
+    await registry.tools.get("take_over_task")!.execute({ agentLabel: "Replacement", reason: "The original thread was abandoned" });
+
+    expect(toolHandlers.confirmTakeover).toHaveBeenCalledWith(assigned, "Replacement", "The original thread was abandoned", expect.any(AbortSignal));
+    expect(toolHandlers.runCommand).toHaveBeenCalledWith({
+      type: "take_over_task",
+      taskId: assigned.id,
+      assignmentId: assigned.assignment.id,
+      agentLabel: "Replacement",
+      reason: "The original thread was abandoned",
+    }, expect.any(AbortSignal));
   });
 
   it("cancels registration before any stale profile tool is added", async () => {
@@ -357,19 +382,20 @@ describe("dynamic WebMCP profiles", () => {
     expect(liveBoard.tasks).toEqual([]);
   });
 
-  it("does not label lease-renewing assignment tools as read-only", async () => {
+  it("keeps assignment reads read-only now that ownership does not expire", async () => {
     const registry = new Registry();
     await registerBoardTools(registry, handlers(board(task("in_pr", true))), new AbortController().signal);
 
     expect(registry.tools.get("list_tasks")?.annotations?.readOnlyHint).toBe(true);
-    for (const name of ["inspect_task", "read_pull_request", "read_review", "check_status"]) {
-      expect(registry.tools.get(name)?.annotations?.readOnlyHint, name).toBe(false);
+    for (const name of ["inspect_task", "read_pull_request", "read_review"]) {
+      expect(registry.tools.get(name)?.annotations?.readOnlyHint, name).toBe(true);
     }
+    expect(registry.tools.get("check_status")?.annotations?.readOnlyHint).toBe(false);
   });
 
-  it.each(["ready", "in_progress"] satisfies TaskColumn[])("marks %s plan reads as lease-renewing", async (column) => {
+  it.each(["ready", "in_progress"] satisfies TaskColumn[])("marks %s plan reads as read-only", async (column) => {
     const registry = new Registry();
     await registerBoardTools(registry, handlers(board(task(column, true))), new AbortController().signal);
-    expect(registry.tools.get("read_plan")?.annotations?.readOnlyHint).toBe(false);
+    expect(registry.tools.get("read_plan")?.annotations?.readOnlyHint).toBe(true);
   });
 });

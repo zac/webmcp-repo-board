@@ -15,6 +15,7 @@ import {
   type AssignmentView,
   type BoardSocketMessage,
   type BoardView,
+  type ClientIdentity,
   type CommandEnvelope,
   type InternalBoardCommand,
   type PlanRevision,
@@ -27,7 +28,6 @@ import {
   type Viewer,
 } from "../shared";
 
-const LEASE_MS = 15 * 60 * 1_000;
 const RECONCILE_MS = 5 * 60 * 1_000;
 const MAX_TASKS = 200;
 const MAX_TOTAL_TASKS = 1_000;
@@ -77,6 +77,9 @@ interface AssignmentRow extends Record<string, SqlStorageValue> {
   claimed_at: number;
   last_activity_at: number;
   lease_expires_at: number;
+  client_id: string;
+  capability_hash: string;
+  last_seen_at: number;
   phase: AgentPhase;
   summary: string;
   stats_json: string;
@@ -84,6 +87,7 @@ interface AssignmentRow extends Record<string, SqlStorageValue> {
 
 interface SocketAttachment {
   viewer: Viewer;
+  clientId: string;
   authorizedUntil: number;
   lastRevision: number;
 }
@@ -131,13 +135,13 @@ export class RepositoryBoard extends DurableObject<Env> {
     );
   }
 
-  async getView(viewer: Viewer, includeArchived = false): Promise<RpcResult<BoardView>> {
+  async getView(viewer: Viewer, includeArchived = false, clientId: string | null = null): Promise<RpcResult<BoardView>> {
     const metadata = this.getMetadata();
     if (!metadata) return failure("board_not_initialized", "Board has not been initialized", 404);
-    return success(this.buildView(metadata, viewer, includeArchived));
+    return success(this.buildView(metadata, viewer, includeArchived, clientId));
   }
 
-  async execute(actor: Actor, viewer: Viewer, envelope: CommandEnvelope<InternalBoardCommand>, now: number): Promise<RpcResult<BoardView>> {
+  async execute(actor: Actor, viewer: Viewer, client: ClientIdentity, envelope: CommandEnvelope<InternalBoardCommand>, now: number): Promise<RpcResult<BoardView>> {
     const metadata = this.getMetadata();
     if (!metadata) return failure("board_not_initialized", "Board has not been initialized", 404);
 
@@ -146,21 +150,21 @@ export class RepositoryBoard extends DurableObject<Env> {
       .toArray()[0];
     if (processed) {
       if (processed.actor_user_id !== actor.userId) return failure("action_owner_mismatch", "Action ID was already used by another user", 409);
-      if (processed.processed_at >= now - ACTION_RECEIPT_MS) return success(this.buildView(metadata, viewer, false));
+      if (processed.processed_at >= now - ACTION_RECEIPT_MS) return success(this.buildView(metadata, viewer, false, client.id));
       this.ctx.storage.sql.exec("DELETE FROM processed_actions WHERE action_id = ?", envelope.actionId);
     }
 
     const currentRevision = this.currentRevision();
     if (envelope.expectedRevision !== currentRevision) {
       if (envelope.command.type === "claim_task") {
-        const active = this.activeAssignment(envelope.command.taskId, now);
+        const active = this.activeAssignment(envelope.command.taskId);
         if (active) {
           return failure(
             "assignment_conflict",
-            `${active.user_login} owns this task until ${new Date(active.lease_expires_at).toISOString()}`,
+            `${active.agent_label} owned by @${active.user_login} has this task until it is released or explicitly taken over`,
             409,
             currentRevision,
-            { ownerLogin: active.user_login, leaseExpiresAt: active.lease_expires_at },
+            { ownerLogin: active.user_login, ownerAgentLabel: active.agent_label },
           );
         }
       }
@@ -170,10 +174,10 @@ export class RepositoryBoard extends DurableObject<Env> {
     try {
       let result!: RpcResult<BoardView>;
       this.ctx.storage.transactionSync(() => {
-        const event = this.applyCommand(metadata, actor, envelope.command, now, currentRevision + 1);
+        const event = this.applyCommand(metadata, actor, client, envelope.command, now, currentRevision + 1);
         this.ctx.storage.sql.exec("UPDATE board_metadata SET revision = ? WHERE id = ?", currentRevision + 1, metadata.id);
         this.insertEvent(currentRevision + 1, event.type, event.taskId, actor.login, now, event.data);
-        result = success(this.buildView(metadata, viewer, false));
+        result = success(this.buildView(metadata, viewer, false, client.id));
         this.ctx.storage.sql.exec(
           "INSERT INTO processed_actions (action_id, actor_user_id, revision, processed_at) VALUES (?, ?, ?, ?)",
           envelope.actionId,
@@ -291,7 +295,7 @@ export class RepositoryBoard extends DurableObject<Env> {
     }
     this.broadcast(revision);
     await this.rescheduleAlarm();
-    return success(this.buildView(metadata, systemViewer(), false));
+    return success(this.buildView(metadata, systemViewer(), false, null));
   }
 
   async recordPullRequestRefreshFailure(taskId: string, generation: number, now: number): Promise<void> {
@@ -313,17 +317,19 @@ export class RepositoryBoard extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return new Response("WebSocket required", { status: 426 });
     const viewerHeader = request.headers.get("x-board-viewer");
+    const clientId = request.headers.get("x-board-client-id");
     const authorizedUntil = Number(request.headers.get("x-board-authorized-until"));
     const lastRevision = Number(new URL(request.url).searchParams.get("revision") ?? "0");
-    if (!viewerHeader || !Number.isFinite(authorizedUntil)) return new Response("Unauthorized", { status: 401 });
+    if (!viewerHeader || !clientId || !Number.isFinite(authorizedUntil)) return new Response("Unauthorized", { status: 401 });
     const viewer = JSON.parse(viewerHeader) as Viewer;
 
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
-    const attachment: SocketAttachment = { viewer, authorizedUntil, lastRevision };
+    const attachment: SocketAttachment = { viewer, clientId, authorizedUntil, lastRevision };
     server.serializeAttachment(attachment);
     this.ctx.acceptWebSocket(server);
+    this.markClientSeen(clientId, Date.now());
 
     const metadata = this.getMetadata();
     if (metadata) {
@@ -331,10 +337,11 @@ export class RepositoryBoard extends DurableObject<Env> {
       const message: BoardSocketMessage = {
         type: "snapshot",
         revision,
-        board: this.buildView(metadata, viewer, false),
+        board: this.buildView(metadata, viewer, false, clientId),
         events: this.eventsSince(lastRevision),
       };
       server.send(JSON.stringify(message));
+      this.broadcast(revision, server);
     }
     await this.rescheduleAlarm();
     return new Response(null, { status: 101, webSocket: client });
@@ -346,16 +353,20 @@ export class RepositoryBoard extends DurableObject<Env> {
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
+    const attachment = ws.deserializeAttachment() as SocketAttachment | null;
+    if (attachment) {
+      attachment.authorizedUntil = 0;
+      ws.serializeAttachment(attachment);
+      this.markClientSeen(attachment.clientId, Date.now());
+    }
     ws.close(code, reason);
+    if (attachment) this.broadcast(this.currentRevision());
   }
 
   async alarm(): Promise<void> {
     const now = Date.now();
     const metadata = this.getMetadata();
     if (!metadata) return;
-    const expiredAssignments = this.ctx.storage.sql
-      .exec<{ id: string; task_id: string; user_login: string }>("SELECT id, task_id, user_login FROM assignments WHERE status = 'active' AND lease_expires_at <= ?", now)
-      .toArray();
     const duePullRequests = this.ctx.storage.sql.exec<{ task_id: string }>(
       `SELECT pr.task_id FROM pr_snapshots pr JOIN tasks task ON task.id = pr.task_id
        WHERE task.archived_at IS NULL AND pr.next_reconcile_at <= ?`,
@@ -364,7 +375,6 @@ export class RepositoryBoard extends DurableObject<Env> {
 
     let revision: number | null = null;
     this.ctx.storage.transactionSync(() => {
-      this.ctx.storage.sql.exec("UPDATE assignments SET status = 'expired', last_activity_at = ? WHERE status = 'active' AND lease_expires_at <= ?", now, now);
       this.ctx.storage.sql.exec(
         `UPDATE pr_snapshots SET reconcile_due = 1, next_reconcile_at = ?
          WHERE task_id IN (SELECT pr.task_id FROM pr_snapshots pr JOIN tasks task ON task.id = pr.task_id
@@ -372,12 +382,9 @@ export class RepositoryBoard extends DurableObject<Env> {
         now + RECONCILE_MS,
         now,
       );
-      if (expiredAssignments.length === 0 && duePullRequests.length === 0) return;
+      if (duePullRequests.length === 0) return;
       revision = this.currentRevision() + 1;
       this.ctx.storage.sql.exec("UPDATE board_metadata SET revision = ? WHERE id = ?", revision, metadata.id);
-      for (const assignment of expiredAssignments) {
-        this.insertEvent(revision, "assignment_expired", assignment.task_id, assignment.user_login, now, { assignmentId: assignment.id });
-      }
       for (const pullRequest of duePullRequests) {
         this.insertEvent(revision, "pull_request_reconciliation_due", pullRequest.task_id, "system", now, {});
       }
@@ -393,7 +400,7 @@ export class RepositoryBoard extends DurableObject<Env> {
     await this.rescheduleAlarm();
   }
 
-  private applyCommand(metadata: BoardMetadata, actor: Actor, command: InternalBoardCommand, now: number, revision: number): { type: string; taskId: string | null; data: Record<string, string | number | boolean | null> } {
+  private applyCommand(metadata: BoardMetadata, actor: Actor, client: ClientIdentity, command: InternalBoardCommand, now: number, revision: number): { type: string; taskId: string | null; data: Record<string, string | number | boolean | null> } {
     switch (command.type) {
       case "create_task": {
         const count = this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM tasks WHERE archived_at IS NULL").one().count;
@@ -420,7 +427,7 @@ export class RepositoryBoard extends DurableObject<Env> {
       case "edit_task": {
         const task = this.requireTask(command.taskId);
         if (task.column_name !== "todo" || task.archived_at !== null) throw new BoardError("task_not_editable", "Only active Todo tasks can be edited", 409);
-        if (this.activeAssignment(task.id, now)) throw new BoardError("task_assigned", "Release the planning assignment before editing this task", 409);
+        if (this.activeAssignment(task.id)) throw new BoardError("task_assigned", "Release the planning assignment before editing this task", 409);
         this.ctx.storage.sql.exec("UPDATE tasks SET title = ?, description = ?, updated_at = ?, task_revision = ? WHERE id = ?", command.title, command.description, now, revision, task.id);
         this.insertTaskRevision(task.id, revision, command.title, command.description, actor, now);
         return { type: "task_edited", taskId: task.id, data: { title: command.title } };
@@ -434,22 +441,26 @@ export class RepositoryBoard extends DurableObject<Env> {
         if (task.column_name !== "in_pr" && command.kind === "implementation" && focus !== "implementation") {
           throw new BoardError("invalid_assignment_focus", "Specialized implementation focus is available only for In PR tasks", 409);
         }
-        const active = this.activeAssignment(task.id, now);
+        const active = this.activeAssignment(task.id);
         if (active) throw new BoardError(
           "assignment_conflict",
-          `${active.user_login} owns this task until ${new Date(active.lease_expires_at).toISOString()}`,
+          `${active.agent_label} owned by @${active.user_login} has this task until it is released or explicitly taken over`,
           409,
-          { ownerLogin: active.user_login, leaseExpiresAt: active.lease_expires_at },
+          { ownerLogin: active.user_login, ownerAgentLabel: active.agent_label },
         );
-        this.ctx.storage.sql.exec("UPDATE assignments SET status = 'expired' WHERE task_id = ? AND status = 'active' AND lease_expires_at <= ?", task.id, now);
+        const currentClientAssignment = this.activeAssignmentForClient(actor.userId, client.id);
+        if (currentClientAssignment) throw new BoardError("client_already_assigned", "This browser tab already owns another task. Release or complete it before claiming more work", 409);
         const assignmentId = crypto.randomUUID();
         const phase: AgentPhase = focus === "planning" ? "planning"
           : focus === "review_feedback" ? "reviewing"
             : focus === "fix_checks" || focus === "merge_preparation" ? "testing"
               : "investigating";
         this.ctx.storage.sql.exec(
-          `INSERT INTO assignments (id, task_id, kind, focus, user_id, user_login, agent_label, status, claimed_at, last_activity_at, lease_expires_at, phase, summary, stats_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, '', '{}')`,
+          `INSERT INTO assignments (
+             id, task_id, kind, focus, user_id, user_login, agent_label, status,
+             claimed_at, last_activity_at, lease_expires_at, client_id, capability_hash, last_seen_at,
+             phase, summary, stats_json
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, 0, ?, ?, ?, ?, '', '{}')`,
           assignmentId,
           task.id,
           command.kind,
@@ -459,21 +470,56 @@ export class RepositoryBoard extends DurableObject<Env> {
           command.agentLabel,
           now,
           now,
-          now + LEASE_MS,
+          client.id,
+          client.capabilityHash,
+          now,
           phase,
         );
         this.ctx.storage.sql.exec("UPDATE tasks SET updated_at = ?, task_revision = ? WHERE id = ?", now, revision, task.id);
         return { type: "task_claimed", taskId: task.id, data: { assignmentId, kind: command.kind, focus, agentLabel: command.agentLabel } };
       }
-      case "renew_assignment": {
-        const assignment = this.requireAssignment(command.assignmentId, actor, now);
-        this.renewAssignment(assignment.id, now, assignment.phase, assignment.summary, parseStats(assignment.stats_json));
-        this.ctx.storage.sql.exec("UPDATE tasks SET updated_at = ?, task_revision = ? WHERE id = ?", now, revision, assignment.task_id);
-        return { type: "assignment_renewed", taskId: assignment.task_id, data: { assignmentId: assignment.id } };
+      case "take_over_task": {
+        const task = this.requireTask(command.taskId);
+        const former = this.activeAssignment(task.id);
+        if (!former || former.id !== command.assignmentId) throw new BoardError("assignment_changed", "The assignment changed before takeover was confirmed", 409);
+        if (former.client_id === client.id && former.capability_hash === client.capabilityHash) {
+          throw new BoardError("assignment_already_owned", "This browser tab already owns the assignment", 409);
+        }
+        const currentClientAssignment = this.activeAssignmentForClient(actor.userId, client.id);
+        if (currentClientAssignment) throw new BoardError("client_already_assigned", "This browser tab already owns another task. Release or complete it before taking over more work", 409);
+        this.ctx.storage.sql.exec("UPDATE assignments SET status = 'superseded', last_activity_at = ? WHERE id = ?", now, former.id);
+        const assignmentId = crypto.randomUUID();
+        const phase: AgentPhase = former.focus === "planning" ? "planning"
+          : former.focus === "review_feedback" ? "reviewing"
+            : former.focus === "fix_checks" || former.focus === "merge_preparation" ? "testing"
+              : "investigating";
+        this.ctx.storage.sql.exec(
+          `INSERT INTO assignments (
+             id, task_id, kind, focus, user_id, user_login, agent_label, status,
+             claimed_at, last_activity_at, lease_expires_at, client_id, capability_hash, last_seen_at,
+             phase, summary, stats_json
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, 0, ?, ?, ?, ?, ?, '{}')`,
+          assignmentId,
+          task.id,
+          former.kind,
+          former.focus,
+          actor.userId,
+          actor.login,
+          command.agentLabel,
+          now,
+          now,
+          client.id,
+          client.capabilityHash,
+          now,
+          phase,
+          `Took over assignment: ${command.reason}`,
+        );
+        this.ctx.storage.sql.exec("UPDATE tasks SET updated_at = ?, task_revision = ? WHERE id = ?", now, revision, task.id);
+        return { type: "assignment_taken_over", taskId: task.id, data: { assignmentId, formerAssignmentId: former.id, reason: command.reason } };
       }
       case "report_progress": {
-        const assignment = this.requireAssignment(command.assignmentId, actor, now);
-        this.renewAssignment(assignment.id, now, command.phase, command.summary, command.stats);
+        const assignment = this.requireAssignment(command.assignmentId, actor, client);
+        this.updateAssignment(assignment.id, now, command.phase, command.summary, command.stats);
         this.ctx.storage.sql.exec(
           "INSERT INTO progress_reports (id, assignment_id, task_id, phase, summary, stats_json, reported_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
           crypto.randomUUID(), assignment.id, assignment.task_id, command.phase, command.summary, JSON.stringify(command.stats), now,
@@ -482,7 +528,7 @@ export class RepositoryBoard extends DurableObject<Env> {
         return { type: "progress_reported", taskId: assignment.task_id, data: { phase: command.phase, summary: command.summary } };
       }
       case "set_plan": {
-        const assignment = this.requireAssignment(command.assignmentId, actor, now, "planning");
+        const assignment = this.requireAssignment(command.assignmentId, actor, client, "planning");
         const task = this.requireTask(assignment.task_id);
         if (task.column_name !== "todo") throw new BoardError("invalid_transition", "A plan can only be set on a Todo task", 409);
         const planRevision = task.latest_plan_revision + 1;
@@ -492,7 +538,7 @@ export class RepositoryBoard extends DurableObject<Env> {
         return { type: "plan_set", taskId: task.id, data: { planRevision, column: "ready" } };
       }
       case "set_plan_and_start_work": {
-        const planningAssignment = this.requireAssignment(command.assignmentId, actor, now, "planning");
+        const planningAssignment = this.requireAssignment(command.assignmentId, actor, client, "planning");
         const task = this.requireTask(planningAssignment.task_id);
         if (task.column_name !== "todo") throw new BoardError("invalid_transition", "A plan can only be set and started on a Todo task", 409);
         const planRevision = task.latest_plan_revision + 1;
@@ -500,8 +546,11 @@ export class RepositoryBoard extends DurableObject<Env> {
         this.insertPlan(task.id, planRevision, command.markdown, actor, now);
         this.ctx.storage.sql.exec("UPDATE assignments SET status = 'completed', last_activity_at = ? WHERE id = ?", now, planningAssignment.id);
         this.ctx.storage.sql.exec(
-          `INSERT INTO assignments (id, task_id, kind, focus, user_id, user_login, agent_label, status, claimed_at, last_activity_at, lease_expires_at, phase, summary, stats_json)
-           VALUES (?, ?, 'implementation', 'implementation', ?, ?, ?, 'active', ?, ?, ?, 'implementing', 'Implementation started', '{}')`,
+          `INSERT INTO assignments (
+             id, task_id, kind, focus, user_id, user_login, agent_label, status,
+             claimed_at, last_activity_at, lease_expires_at, client_id, capability_hash, last_seen_at,
+             phase, summary, stats_json
+           ) VALUES (?, ?, 'implementation', 'implementation', ?, ?, ?, 'active', ?, ?, 0, ?, ?, ?, 'implementing', 'Implementation started', '{}')`,
           implementationAssignmentId,
           task.id,
           actor.userId,
@@ -509,42 +558,44 @@ export class RepositoryBoard extends DurableObject<Env> {
           planningAssignment.agent_label,
           now,
           now,
-          now + LEASE_MS,
+          planningAssignment.client_id,
+          planningAssignment.capability_hash,
+          now,
         );
         this.ctx.storage.sql.exec("UPDATE tasks SET column_name = 'in_progress', latest_plan_revision = ?, updated_at = ?, task_revision = ? WHERE id = ?", planRevision, now, revision, task.id);
         this.insertEvent(revision, "plan_set", task.id, actor.login, now, { planRevision, column: "ready" });
         return { type: "work_started", taskId: task.id, data: { assignmentId: implementationAssignmentId, planRevision, column: "in_progress" } };
       }
       case "update_plan": {
-        const assignment = this.requireAssignment(command.assignmentId, actor, now, "implementation");
+        const assignment = this.requireAssignment(command.assignmentId, actor, client, "implementation");
         const task = this.requireTask(assignment.task_id);
         if (task.column_name !== "ready") throw new BoardError("invalid_transition", "An implementation agent can update a plan only while the task is Ready", 409);
         const planRevision = task.latest_plan_revision + 1;
         this.insertPlan(task.id, planRevision, command.markdown, actor, now);
-        this.renewAssignment(assignment.id, now, "planning", "Updated the delegated plan", parseStats(assignment.stats_json));
+        this.updateAssignment(assignment.id, now, "planning", "Updated the delegated plan", parseStats(assignment.stats_json));
         this.ctx.storage.sql.exec("UPDATE tasks SET latest_plan_revision = ?, updated_at = ?, task_revision = ? WHERE id = ?", planRevision, now, revision, task.id);
         return { type: "plan_updated", taskId: task.id, data: { planRevision } };
       }
       case "start_work": {
-        const assignment = this.requireAssignment(command.assignmentId, actor, now, "implementation");
+        const assignment = this.requireAssignment(command.assignmentId, actor, client, "implementation");
         const task = this.requireTask(assignment.task_id);
         if (task.column_name !== "ready" || task.latest_plan_revision < 1) throw new BoardError("invalid_transition", "Only a Ready task with a plan can start work", 409);
-        this.renewAssignment(assignment.id, now, "implementing", "Implementation started", parseStats(assignment.stats_json));
+        this.updateAssignment(assignment.id, now, "implementing", "Implementation started", parseStats(assignment.stats_json));
         this.ctx.storage.sql.exec("UPDATE tasks SET column_name = 'in_progress', updated_at = ?, task_revision = ? WHERE id = ?", now, revision, task.id);
         return { type: "work_started", taskId: task.id, data: { column: "in_progress" } };
       }
       case "release_task": {
-        const assignment = this.requireAssignment(command.assignmentId, actor, now);
+        const assignment = this.requireAssignment(command.assignmentId, actor, client);
         this.ctx.storage.sql.exec("UPDATE assignments SET status = 'released', last_activity_at = ? WHERE id = ?", now, assignment.id);
         this.ctx.storage.sql.exec("UPDATE tasks SET updated_at = ?, task_revision = ? WHERE id = ?", now, revision, assignment.task_id);
         return { type: "task_released", taskId: assignment.task_id, data: { assignmentId: assignment.id } };
       }
       case "link_pull_request_snapshot": {
-        const assignment = this.requireAssignment(command.assignmentId, actor, now, "implementation");
+        const assignment = this.requireAssignment(command.assignmentId, actor, client, "implementation");
         const task = this.requireTask(assignment.task_id);
         if (task.column_name !== "in_progress") throw new BoardError("invalid_transition", "A pull request can be linked only while work is in progress", 409);
         if (command.snapshot.state !== "open" || command.snapshot.merged) throw new BoardError("pull_request_not_open", "The linked pull request must be open", 409);
-        this.renewAssignment(assignment.id, now, "waiting", `Linked PR #${command.snapshot.number}`, parseStats(assignment.stats_json));
+        this.updateAssignment(assignment.id, now, "waiting", `Linked PR #${command.snapshot.number}`, parseStats(assignment.stats_json));
         this.ctx.storage.sql.exec("UPDATE tasks SET column_name = 'in_pr', linked_pr_number = ?, updated_at = ?, task_revision = ? WHERE id = ?", command.snapshot.number, now, revision, task.id);
         this.ctx.storage.sql.exec(
           `INSERT INTO pr_snapshots (
@@ -625,9 +676,10 @@ export class RepositoryBoard extends DurableObject<Env> {
         id TEXT PRIMARY KEY, task_id TEXT NOT NULL, kind TEXT NOT NULL, focus TEXT NOT NULL,
         user_id TEXT NOT NULL, user_login TEXT NOT NULL,
         agent_label TEXT NOT NULL, status TEXT NOT NULL, claimed_at INTEGER NOT NULL, last_activity_at INTEGER NOT NULL,
-        lease_expires_at INTEGER NOT NULL, phase TEXT NOT NULL, summary TEXT NOT NULL, stats_json TEXT NOT NULL
+        lease_expires_at INTEGER NOT NULL, client_id TEXT NOT NULL DEFAULT '', capability_hash TEXT NOT NULL DEFAULT '',
+        last_seen_at INTEGER NOT NULL DEFAULT 0, phase TEXT NOT NULL, summary TEXT NOT NULL, stats_json TEXT NOT NULL
       );
-      CREATE INDEX IF NOT EXISTS assignments_active_idx ON assignments(task_id, status, lease_expires_at);
+      CREATE INDEX IF NOT EXISTS assignments_active_idx ON assignments(task_id, status);
       CREATE TABLE IF NOT EXISTS progress_reports (
         id TEXT PRIMARY KEY, assignment_id TEXT NOT NULL, task_id TEXT NOT NULL, phase TEXT NOT NULL,
         summary TEXT NOT NULL, stats_json TEXT NOT NULL, reported_at INTEGER NOT NULL
@@ -649,6 +701,14 @@ export class RepositoryBoard extends DurableObject<Env> {
         delivery_id TEXT PRIMARY KEY, processed_at INTEGER NOT NULL
       );
     `);
+    const assignmentColumns = new Set(this.ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(assignments)").toArray().map((column) => column.name));
+    if (!assignmentColumns.has("client_id")) this.ctx.storage.sql.exec("ALTER TABLE assignments ADD COLUMN client_id TEXT NOT NULL DEFAULT ''");
+    if (!assignmentColumns.has("capability_hash")) this.ctx.storage.sql.exec("ALTER TABLE assignments ADD COLUMN capability_hash TEXT NOT NULL DEFAULT ''");
+    if (!assignmentColumns.has("last_seen_at")) this.ctx.storage.sql.exec("ALTER TABLE assignments ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0");
+    this.ctx.storage.sql.exec("UPDATE assignments SET status = 'expired' WHERE status = 'active' AND lease_expires_at > 0 AND lease_expires_at <= ?", Date.now());
+    this.ctx.storage.sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS assignments_one_active_idx ON assignments(task_id) WHERE status = 'active'");
+    this.ctx.storage.sql.exec("DROP INDEX IF EXISTS assignments_one_client_idx");
+    this.ctx.storage.sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS assignments_one_user_client_idx ON assignments(user_id, client_id) WHERE status = 'active' AND client_id != ''");
   }
 
   private getMetadata(): BoardMetadata | null {
@@ -684,33 +744,39 @@ export class RepositoryBoard extends DurableObject<Env> {
     throw new BoardError("task_reference_exhausted", "This board has no remaining task references", 409);
   }
 
-  private activeAssignment(taskId: string, now: number): AssignmentRow | null {
-    return this.ctx.storage.sql.exec<AssignmentRow>("SELECT * FROM assignments WHERE task_id = ? AND status = 'active' AND lease_expires_at > ? ORDER BY claimed_at DESC LIMIT 1", taskId, now).toArray()[0] ?? null;
+  private activeAssignment(taskId: string): AssignmentRow | null {
+    return this.ctx.storage.sql.exec<AssignmentRow>("SELECT * FROM assignments WHERE task_id = ? AND status = 'active' ORDER BY claimed_at DESC LIMIT 1", taskId).toArray()[0] ?? null;
   }
 
-  private requireAssignment(assignmentId: string, actor: Actor, now: number, kind?: AssignmentKind): AssignmentRow {
+  private activeAssignmentForClient(userId: string, clientId: string): AssignmentRow | null {
+    return this.ctx.storage.sql.exec<AssignmentRow>("SELECT * FROM assignments WHERE user_id = ? AND client_id = ? AND status = 'active' LIMIT 1", userId, clientId).toArray()[0] ?? null;
+  }
+
+  private requireAssignment(assignmentId: string, actor: Actor, client: ClientIdentity, kind?: AssignmentKind): AssignmentRow {
     const assignment = this.ctx.storage.sql.exec<AssignmentRow>("SELECT * FROM assignments WHERE id = ?", assignmentId).toArray()[0];
     if (!assignment) throw new BoardError("assignment_not_found", "Assignment was not found", 404);
     if (assignment.user_id !== actor.userId) throw new BoardError("assignment_owner_mismatch", "Assignment belongs to another GitHub user", 403);
     if (assignment.status !== "active") throw new BoardError("assignment_inactive", "Assignment is no longer active", 409);
-    if (assignment.lease_expires_at <= now) {
-      this.ctx.storage.sql.exec("UPDATE assignments SET status = 'expired' WHERE id = ?", assignment.id);
-      throw new BoardError("assignment_expired", "Assignment lease expired and the task can be claimed again", 409);
+    if (assignment.client_id !== client.id || assignment.capability_hash !== client.capabilityHash) {
+      throw new BoardError("assignment_client_mismatch", "Assignment belongs to another browser tab. Take it over explicitly to continue here", 409);
     }
     if (kind && assignment.kind !== kind) throw new BoardError("wrong_assignment_kind", `This command requires a ${kind} assignment`, 409);
     return assignment;
   }
 
-  private renewAssignment(id: string, now: number, phase: AgentPhase, summary: string, stats: AgentStats): void {
+  private updateAssignment(id: string, now: number, phase: AgentPhase, summary: string, stats: AgentStats): void {
     this.ctx.storage.sql.exec(
-      "UPDATE assignments SET last_activity_at = ?, lease_expires_at = ?, phase = ?, summary = ?, stats_json = ? WHERE id = ?",
+      "UPDATE assignments SET last_activity_at = ?, phase = ?, summary = ?, stats_json = ? WHERE id = ?",
       now,
-      now + LEASE_MS,
       phase,
       summary,
       JSON.stringify(stats),
       id,
     );
+  }
+
+  private markClientSeen(clientId: string, now: number): void {
+    this.ctx.storage.sql.exec("UPDATE assignments SET last_seen_at = ? WHERE client_id = ? AND status = 'active'", now, clientId);
   }
 
   private insertPlan(taskId: string, revision: number, markdown: string, actor: Actor, now: number): void {
@@ -769,11 +835,12 @@ export class RepositoryBoard extends DurableObject<Env> {
     );
   }
 
-  private buildView(metadata: BoardMetadata, viewer: Viewer, includeArchived: boolean): BoardView {
+  private buildView(metadata: BoardMetadata, viewer: Viewer, includeArchived: boolean, clientId: string | null): BoardView {
+    const connectedClients = this.connectedClientIds();
     const tasks = this.ctx.storage.sql
       .exec<TaskRow>(`SELECT * FROM tasks ${includeArchived ? "" : "WHERE archived_at IS NULL"} ORDER BY created_at ASC LIMIT ?`, MAX_TASKS)
       .toArray()
-      .map((task) => this.buildTaskView(task, viewer));
+      .map((task) => this.buildTaskView(task, viewer, clientId, connectedClients));
     const archivedTaskCount = this.ctx.storage.sql
       .exec<{ count: number }>("SELECT COUNT(*) AS count FROM tasks WHERE archived_at IS NOT NULL")
       .one().count;
@@ -792,8 +859,8 @@ export class RepositoryBoard extends DurableObject<Env> {
     };
   }
 
-  private buildTaskView(task: TaskRow, viewer: Viewer): TaskView {
-    const assignment = this.ctx.storage.sql.exec<AssignmentRow>("SELECT * FROM assignments WHERE task_id = ? AND status = 'active' AND lease_expires_at > ? ORDER BY claimed_at DESC LIMIT 1", task.id, Date.now()).toArray()[0];
+  private buildTaskView(task: TaskRow, viewer: Viewer, clientId: string | null, connectedClients: Set<string>): TaskView {
+    const assignment = this.ctx.storage.sql.exec<AssignmentRow>("SELECT * FROM assignments WHERE task_id = ? AND status = 'active' ORDER BY claimed_at DESC LIMIT 1", task.id).toArray()[0];
     const planRow = task.latest_plan_revision > 0
       ? this.ctx.storage.sql.exec<{ revision: number; markdown: string; author_user_id: string; author_login: string; created_at: number }>("SELECT revision, markdown, author_user_id, author_login, created_at FROM plan_revisions WHERE task_id = ? AND revision = ?", task.id, task.latest_plan_revision).toArray()[0]
       : undefined;
@@ -818,7 +885,7 @@ export class RepositoryBoard extends DurableObject<Env> {
         .toArray()
         .map((row) => ({ revision: row.revision, title: row.title, description: row.description, authorUserId: row.author_user_id, authorLogin: row.author_login, createdAt: row.created_at } satisfies TaskRevision)),
       plan: planRow ? { revision: planRow.revision, markdown: planRow.markdown, authorUserId: planRow.author_user_id, authorLogin: planRow.author_login, createdAt: planRow.created_at, delegatedApproval: true } satisfies PlanRevision : null,
-      assignment: assignment ? assignmentView(assignment, viewer.userId) : null,
+      assignment: assignment ? assignmentView(assignment, viewer.userId, clientId, connectedClients.has(assignment.client_id)) : null,
       pullRequest: prRow ? JSON.parse(prRow.snapshot_json) as PullRequestSnapshot : null,
       recentEvents: this.ctx.storage.sql.exec<{ id: number; revision: number; event_type: string; task_id: string | null; actor_login: string | null; occurred_at: number; data_json: string }>("SELECT * FROM events WHERE task_id = ? ORDER BY id DESC LIMIT 20", task.id).toArray().map(eventView),
     };
@@ -828,13 +895,14 @@ export class RepositoryBoard extends DurableObject<Env> {
     return this.ctx.storage.sql.exec<{ id: number; revision: number; event_type: string; task_id: string | null; actor_login: string | null; occurred_at: number; data_json: string }>("SELECT * FROM events WHERE revision > ? ORDER BY id ASC LIMIT 100", revision).toArray().map(eventView);
   }
 
-  private broadcast(revision: number): void {
+  private broadcast(revision: number, excludedSocket?: WebSocket): void {
     const metadata = this.getMetadata();
     if (!metadata) return;
     for (const socket of this.ctx.getWebSockets()) {
+      if (socket === excludedSocket) continue;
       const attachment = socket.deserializeAttachment() as SocketAttachment | null;
       if (!attachment || attachment.authorizedUntil <= Date.now()) continue;
-      const message: BoardSocketMessage = { type: "updated", revision, board: this.buildView(metadata, attachment.viewer, false), events: this.eventsSince(attachment.lastRevision) };
+      const message: BoardSocketMessage = { type: "updated", revision, board: this.buildView(metadata, attachment.viewer, false, attachment.clientId), events: this.eventsSince(attachment.lastRevision) };
       attachment.lastRevision = revision;
       socket.serializeAttachment(attachment);
       socket.send(JSON.stringify(message));
@@ -843,7 +911,6 @@ export class RepositoryBoard extends DurableObject<Env> {
 
   private async rescheduleAlarm(): Promise<void> {
     const now = Date.now();
-    const lease = this.ctx.storage.sql.exec<{ due: number | null }>("SELECT MIN(lease_expires_at) AS due FROM assignments WHERE status = 'active'").one().due;
     const reconcile = this.ctx.storage.sql.exec<{ due: number | null }>(
       `SELECT MIN(pr.next_reconcile_at) AS due FROM pr_snapshots pr
        JOIN tasks task ON task.id = pr.task_id WHERE task.archived_at IS NULL`,
@@ -853,12 +920,22 @@ export class RepositoryBoard extends DurableObject<Env> {
       const attachment = socket.deserializeAttachment() as SocketAttachment | null;
       if (attachment && (socketDue === null || attachment.authorizedUntil < socketDue)) socketDue = attachment.authorizedUntil;
     }
-    const candidates = [lease, reconcile, socketDue].filter((value): value is number => value !== null && value > now);
+    const candidates = [reconcile, socketDue].filter((value): value is number => value !== null && value > now);
     if (candidates.length === 0) {
       await this.ctx.storage.deleteAlarm();
       return;
     }
     await this.ctx.storage.setAlarm(Math.min(...candidates));
+  }
+
+  private connectedClientIds(): Set<string> {
+    const now = Date.now();
+    const clients = new Set<string>();
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = socket.deserializeAttachment() as SocketAttachment | null;
+      if (attachment && attachment.authorizedUntil > now && socket.readyState === WebSocket.OPEN) clients.add(attachment.clientId);
+    }
+    return clients;
   }
 }
 
@@ -876,7 +953,7 @@ class BoardError extends Error {
     public readonly code: string,
     message: string,
     public readonly status: number,
-    public readonly details?: { ownerLogin?: string; leaseExpiresAt?: number },
+    public readonly details?: { ownerLogin?: string; ownerAgentLabel?: string },
   ) {
     super(message);
     this.name = "BoardError";
@@ -892,7 +969,7 @@ function failure<T>(
   message: string,
   status: number,
   currentRevision?: number,
-  details: { ownerLogin?: string; leaseExpiresAt?: number } = {},
+  details: { ownerLogin?: string; ownerAgentLabel?: string } = {},
 ): RpcResult<T> {
   return { ok: false, error: { code, message, status, ...(currentRevision === undefined ? {} : { currentRevision }), ...details } };
 }
@@ -901,7 +978,7 @@ function parseStats(value: string): AgentStats {
   return JSON.parse(value) as AgentStats;
 }
 
-function assignmentView(row: AssignmentRow, viewerUserId: string | null): AssignmentView {
+function assignmentView(row: AssignmentRow, viewerUserId: string | null, clientId: string | null, connected: boolean): AssignmentView {
   return {
     id: row.id,
     taskId: row.task_id,
@@ -912,11 +989,13 @@ function assignmentView(row: AssignmentRow, viewerUserId: string | null): Assign
     agentLabel: row.agent_label,
     claimedAt: row.claimed_at,
     lastActivityAt: row.last_activity_at,
-    leaseExpiresAt: row.lease_expires_at,
+    lastSeenAt: row.last_seen_at || null,
+    connected,
     phase: row.phase,
     summary: row.summary,
     stats: parseStats(row.stats_json),
     isMine: row.user_id === viewerUserId,
+    isCurrentClient: Boolean(clientId) && row.user_id === viewerUserId && row.client_id === clientId,
   };
 }
 
