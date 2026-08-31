@@ -169,15 +169,15 @@ export async function registerBoardTools(context: WebMcpContext, handlers: Board
   if (board.viewer.canMutate) {
     await add({
       name: "claim_task",
-      title: "Claim a repository task",
-      description: "Atomically claim a Todo task for planning, or a Ready, In Progress, or In PR task for implementation. In PR work may identify review feedback, failing checks, or merge preparation as its focus. The first valid claim wins a renewable 15-minute task-wide write lease.",
+      title: "Claim a task to plan or implement",
+      description: "Call this first when the user asks to plan, groom, implement, address feedback, fix checks, or prepare to merge an existing task. If the user names a task by title, call list_tasks to find its taskRef. For a Todo task, use kind \"planning\". A successful claim activates set_plan and set_plan_and_start_work. For Ready, In Progress, or In PR work, use kind \"implementation\". The first valid claim receives a renewable 15-minute write lease.",
       inputSchema: {
         type: "object", additionalProperties: false,
         properties: {
-          taskRef: { type: "string", minLength: 3, maxLength: 32, description: "The two-word ticket reference, such as amber-fox." },
+          taskRef: { type: "string", minLength: 3, maxLength: 32, description: "The two-word ticket reference, such as amber-fox. Call list_tasks first if the user names the task by title." },
           taskId: { type: "string", minLength: 1, maxLength: 100, description: "Legacy internal UUID. Prefer taskRef." },
-          kind: { type: "string", enum: ["planning", "implementation"] },
-          focus: { type: "string", enum: ["planning", "implementation", "review_feedback", "fix_checks", "merge_preparation"] },
+          kind: { type: "string", enum: ["planning", "implementation"], description: "Use planning to plan or groom a Todo task. Use implementation for Ready, In Progress, or In PR work." },
+          focus: { type: "string", enum: ["planning", "implementation", "review_feedback", "fix_checks", "merge_preparation"], description: "Optional specialization. Use review_feedback, fix_checks, or merge_preparation for In PR follow-up work." },
           agentLabel: { type: "string", minLength: 1, maxLength: 80 },
         },
         required: ["kind", "agentLabel"],

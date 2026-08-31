@@ -126,6 +126,18 @@ describe("dynamic WebMCP profiles", () => {
     expect(await namesFor(board(task("ready")))).toEqual(["list_tasks", "inspect_task", "create_task", "cancel_task", "claim_task"]);
   });
 
+  it("maps natural-language planning requests to the Todo claim flow", async () => {
+    const registry = new Registry();
+    await registerBoardTools(registry, handlers(board(task("todo"))), new AbortController().signal);
+    const claim = registry.tools.get("claim_task")!;
+    const properties = claim.inputSchema.properties as Record<string, { description?: string }>;
+
+    expect(claim.title).toBe("Claim a task to plan or implement");
+    expect(claim.description).toContain("call list_tasks to find its taskRef");
+    expect(claim.description).toContain("A successful claim activates set_plan and set_plan_and_start_work");
+    expect(properties.kind.description).toContain("Use planning to plan or groom a Todo task");
+  });
+
   it("keeps task creation available when no task is selected", async () => {
     const registry = new Registry();
     const boardValue = board(task("in_pr"));
