@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent, type ReactNode } from "react";
 import {
   normalizeTaskReference,
   TASK_COLUMNS,
@@ -32,6 +32,14 @@ const COLUMN_COPY: Record<TaskColumn, { label: string; short: string }> = {
   in_pr: { label: "In PR", short: "GitHub is the status source" },
   done: { label: "Done", short: "Merged and ready to archive" },
 };
+
+const LANDING_WORKFLOW: Array<{ column: TaskColumn; detail: string }> = [
+  { column: "todo", detail: "Needs a human-approved plan" },
+  { column: "ready", detail: "Ready for one agent to claim" },
+  { column: "in_progress", detail: "Owned by an active lease" },
+  { column: "in_pr", detail: "Reviews and checks stay in sync" },
+  { column: "done", detail: "Merged on GitHub" },
+];
 
 const TOOL_COPY: Record<string, string> = {
   list_tasks: "List visible tasks by workflow column.",
@@ -560,8 +568,26 @@ function BoardIndex(props: {
   onLogout: () => void;
   onNavigate: (owner: string, repo: string) => void;
 }): ReactNode {
-  const [owner, setOwner] = useState("");
-  const [repo, setRepo] = useState("");
+  const [repositoryInput, setRepositoryInput] = useState("");
+  const [repositoryError, setRepositoryError] = useState<string | null>(null);
+
+  const openRepository = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const repository = parseRepositoryInput(repositoryInput);
+    if (!repository) {
+      setRepositoryError("Enter owner/repo or paste a GitHub repository URL.");
+      return;
+    }
+    setRepositoryError(null);
+    props.onNavigate(repository.owner, repository.repo);
+  };
+
+  const openBoardLink = (event: MouseEvent<HTMLAnchorElement>, board: BoardSummary) => {
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    props.onOpen(board);
+  };
+
   return (
     <main className="index-page">
       <header className="index-header">
@@ -570,37 +596,89 @@ function BoardIndex(props: {
           {props.user ? <><span className="user-chip">@{props.user.login}</span><button className="text-button" onClick={props.onLogout}>Sign out</button></> : null}
         </div>
       </header>
-      <section className="index-intro">
-        <p className="eyebrow">Repository work, claimed once</p>
-        <h1>A shared board for humans and coding agents.</h1>
-        <p>Plans become assignments. Assignments become pull requests. GitHub closes the loop.</p>
+      <section className="index-hero">
+        <div className="index-intro">
+          <p className="eyebrow">Repository work, claimed once</p>
+          <h1>Open a repo. See who's doing what.</h1>
+          <p>Repo Board gives people and coding agents one live queue from a human-approved plan to a merged pull request. A task can only be claimed once.</p>
+        </div>
+        <form className="repository-launcher" onSubmit={openRepository}>
+          <label htmlFor="repository-path">GitHub repository</label>
+          <div className="launcher-control">
+            <input
+              id="repository-path"
+              name="repository"
+              value={repositoryInput}
+              onChange={(event) => { setRepositoryInput(event.target.value); setRepositoryError(null); }}
+              placeholder="owner/repo or paste a GitHub URL"
+              autoComplete="off"
+              spellCheck={false}
+              aria-invalid={Boolean(repositoryError)}
+              aria-describedby="repository-help repository-error"
+              required
+            />
+            <button className="primary-button" type="submit">Open board</button>
+          </div>
+          <div className="launcher-meta">
+            <p id="repository-help">
+              {props.user
+                ? "Public repositories open immediately. Private repositories need GitHub App access."
+                : <>Public repositories open in preview. <a href={props.config?.githubLoginUrl ?? "/auth/github"}>Sign in with GitHub</a> to create work or access private repositories.</>}
+            </p>
+            <p className="field-error" id="repository-error" aria-live="polite">{repositoryError}</p>
+          </div>
+          {props.config?.localDevelopment && !props.user && <button className="secondary-button development-login" type="button" onClick={props.onDevelopmentLogin}>Use local development session</button>}
+        </form>
       </section>
-      <div className="index-grid">
-        <section className="repository-list" aria-labelledby="boards-heading">
-          <div className="section-heading"><h2 id="boards-heading">Available boards</h2><span>{props.boards.length}</span></div>
-          {props.boards.length ? props.boards.map((board) => (
-            <button className="repository-row" key={board.id} onClick={() => props.onOpen(board)}>
-              <span className="repo-mark" aria-hidden="true">{board.isPrivate ? "●" : "○"}</span>
-              <span><strong>{board.fullName}</strong><small>{board.isPrivate ? "Private repository" : "Public board"}</small></span>
-              <span className="row-arrow" aria-hidden="true">↗</span>
-            </button>
-          )) : <div className="empty-index"><strong>No materialized boards yet.</strong><p>Open any public repository path to preview its empty board.</p></div>}
-        </section>
-        <aside className="connect-panel">
-          <form onSubmit={(event) => { event.preventDefault(); props.onNavigate(owner, repo); }}>
-            <p className="eyebrow">Open any repository</p>
-            <h2>Start with its GitHub path.</h2>
-            <p>Public repositories open as blank previews until an authorized collaborator signs in.</p>
-            <label>Owner<input value={owner} onChange={(event) => setOwner(event.target.value)} placeholder="octocat" required pattern="[A-Za-z0-9_.-]+" /></label>
-            <label>Repository<input value={repo} onChange={(event) => setRepo(event.target.value)} placeholder="hello-world" required pattern="[A-Za-z0-9_.-]+" /></label>
-            <button className="primary-button" type="submit">Open repository board</button>
-            {!props.user && <a className="install-link" href={props.config?.githubLoginUrl ?? "/auth/github"}>Sign in with GitHub</a>}
-            {props.config?.localDevelopment && !props.user && <button className="secondary-button" type="button" onClick={props.onDevelopmentLogin}>Use local development session</button>}
-          </form>
-        </aside>
-      </div>
+      <section className="workflow-proof" aria-labelledby="workflow-heading">
+        <div className="section-heading workflow-heading"><h2 id="workflow-heading">From idea to merge</h2><span>Live workflow</span></div>
+        <ol>
+          {LANDING_WORKFLOW.map(({ column, detail }) => (
+            <li data-column={column} key={column}>
+              <span className="workflow-signal" aria-hidden="true" />
+              <strong>{COLUMN_COPY[column].label}</strong>
+              <small>{detail}</small>
+            </li>
+          ))}
+        </ol>
+      </section>
+      <section className="repository-list index-boards" aria-labelledby="boards-heading">
+        <div className="section-heading"><h2 id="boards-heading">Available boards</h2><span>{props.boards.length}</span></div>
+        {props.boards.length ? props.boards.map((board) => (
+          <a className="repository-row" href={`/boards/${encodeURIComponent(board.owner)}/${encodeURIComponent(board.repo)}`} key={board.id} onClick={(event) => openBoardLink(event, board)}>
+            <span className="repo-mark" aria-hidden="true">{board.isPrivate ? "●" : "○"}</span>
+            <span><strong>{board.fullName}</strong><small>{board.isPrivate ? "Private repository" : "Public board"}</small></span>
+            <span className="row-arrow" aria-hidden="true">→</span>
+          </a>
+        )) : <div className="empty-index"><strong>No boards here yet.</strong><p>Open a public repository above to preview its board.</p></div>}
+      </section>
     </main>
   );
+}
+
+export function parseRepositoryInput(value: string): { owner: string; repo: string } | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  let segments: string[];
+  if (/^(?:https?:\/\/)?(?:www\.)?github\.com\//i.test(trimmed)) {
+    try {
+      const url = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
+      if (!["github.com", "www.github.com"].includes(url.hostname.toLowerCase())) return null;
+      segments = url.pathname.split("/").filter(Boolean).slice(0, 2);
+    } catch {
+      return null;
+    }
+  } else {
+    segments = trimmed.replace(/^\/+|\/+$/g, "").split("/");
+    if (segments.length !== 2) return null;
+  }
+
+  const [owner, rawRepo] = segments;
+  const repo = rawRepo?.replace(/\.git$/i, "");
+  const validSegment = /^[A-Za-z0-9_.-]+$/;
+  if (!owner || !repo || !validSegment.test(owner) || !validSegment.test(repo)) return null;
+  return { owner, repo };
 }
 
 function RepositoryGate(props: {

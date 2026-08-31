@@ -61,16 +61,41 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .index-header { height: 80px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line-dark); }
 .session-control { display: flex; align-items: center; gap: 16px; }
 .user-chip { display: inline-flex; align-items: center; min-height: 26px; padding: 0 9px; border: 1px solid var(--line-dark); border-radius: 999px; background: rgb(255 255 255 / 55%); font: 650 .72rem/1 "SFMono-Regular", monospace; }
-.index-intro { max-width: 840px; padding: clamp(70px, 11vw, 140px) 0 70px; }
-.index-intro h1 { max-width: 780px; margin: 0; font: 650 clamp(3rem, 7vw, 6.6rem)/.92 "SF Pro Rounded", "Arial Rounded MT Bold", system-ui, sans-serif; letter-spacing: -.075em; }
-.index-intro > p:last-child { max-width: 560px; margin: 30px 0 0; color: var(--muted); font-size: 1.12rem; line-height: 1.55; }
-.index-grid { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(320px, .65fr); border-top: 1px solid var(--ink); border-bottom: 1px solid var(--ink); background: rgb(255 255 255 / 60%); }
-.repository-list { min-height: 390px; padding: 28px 34px 34px 0; border-right: 1px solid var(--ink); }
+.index-hero { padding: clamp(58px, 7vw, 88px) 0 42px; }
+.index-intro { max-width: 900px; }
+.index-intro h1 { max-width: 880px; margin: 0; text-wrap: balance; font: 650 clamp(3rem, 6.3vw, 5.8rem)/.94 "SF Pro Rounded", "Arial Rounded MT Bold", system-ui, sans-serif; letter-spacing: -.07em; }
+.index-intro > p:last-child { max-width: 690px; margin: 24px 0 0; color: var(--muted); font-size: 1.08rem; line-height: 1.55; }
+.repository-launcher { max-width: 900px; margin-top: 32px; }
+.repository-launcher > label { display: block; margin-bottom: 8px; color: var(--muted); font: 700 .68rem/1.2 "SFMono-Regular", Consolas, monospace; letter-spacing: .1em; text-transform: uppercase; }
+.launcher-control { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; }
+.launcher-control input { height: 52px; padding-inline: 15px; border-color: var(--ink); border-radius: 6px; font-size: 1rem; box-shadow: 0 1px 0 rgb(0 0 0 / 7%); }
+.launcher-control .primary-button { min-width: 132px; min-height: 52px; }
+.launcher-meta { min-height: 38px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: start; margin-top: 9px; }
+.launcher-meta p { margin: 0; color: var(--muted); font-size: .77rem; line-height: 1.45; }
+.launcher-meta a { color: var(--ink); text-underline-offset: 3px; }
+.launcher-meta .field-error { color: var(--danger); text-align: right; }
+.development-login { margin-top: 8px; }
+.workflow-proof { border-top: 1px solid var(--ink); border-bottom: 1px solid var(--ink); background: rgb(255 255 255 / 52%); }
+.workflow-heading { margin: 0; padding: 17px 20px; border-bottom: 1px solid var(--line-dark); }
+.workflow-proof ol { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); margin: 0; padding: 0; list-style: none; }
+.workflow-proof li { position: relative; min-width: 0; min-height: 110px; padding: 21px 20px 18px; border-right: 1px solid var(--line-dark); }
+.workflow-proof li:last-child { border-right: 0; }
+.workflow-proof li::after { position: absolute; z-index: 1; top: 24px; right: -7px; width: 13px; height: 13px; content: ""; border-top: 1px solid var(--line-dark); border-right: 1px solid var(--line-dark); background: #f7f8fa; transform: rotate(45deg); }
+.workflow-proof li:last-child::after { display: none; }
+.workflow-signal { width: 8px; height: 8px; display: inline-block; margin: 0 8px 1px 0; border-radius: 2px; background: var(--line-dark); }
+.workflow-proof [data-column="ready"] .workflow-signal { background: #7358d4; }
+.workflow-proof [data-column="in_progress"] .workflow-signal { background: var(--cobalt); }
+.workflow-proof [data-column="in_pr"] .workflow-signal { background: #d48b27; }
+.workflow-proof [data-column="done"] .workflow-signal { background: var(--success); }
+.workflow-proof strong { font-size: .9rem; }
+.workflow-proof small { display: block; margin-top: 11px; color: var(--muted); font-size: .75rem; line-height: 1.45; }
+.repository-list { min-height: 250px; padding: 28px 34px 34px 0; }
+.index-boards { border-bottom: 1px solid var(--ink); background: rgb(255 255 255 / 32%); }
 .section-heading, .detail-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .section-heading { margin: 0 0 18px; padding-left: 24px; }
-.section-heading h2, .connect-panel h2 { margin: 0; font-size: 1.25rem; letter-spacing: -.03em; }
+.section-heading h2 { margin: 0; font-size: 1.25rem; letter-spacing: -.03em; }
 .section-heading span, .detail-heading span { color: var(--muted); font: 700 .68rem/1 "SFMono-Regular", monospace; }
-.repository-row { width: 100%; display: grid; grid-template-columns: 28px 1fr auto; align-items: center; gap: 12px; padding: 17px 18px 17px 24px; border: 0; border-top: 1px solid var(--line); text-align: left; background: transparent; cursor: pointer; }
+.repository-row { width: 100%; display: grid; grid-template-columns: 28px 1fr auto; align-items: center; gap: 12px; padding: 17px 18px 17px 24px; border-top: 1px solid var(--line); text-align: left; text-decoration: none; background: transparent; cursor: pointer; }
 .repository-row:last-of-type { border-bottom: 1px solid var(--line); }
 .repository-row:hover { background: #fff; }
 .repository-row strong, .repository-row small { display: block; }
@@ -80,16 +105,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .row-arrow { color: var(--muted); font-size: 1.2rem; }
 .empty-index { margin: 20px 24px; padding: 38px; border: 1px dashed var(--line-dark); text-align: center; background: rgb(255 255 255 / 45%); }
 .empty-index p { color: var(--muted); }
-.connect-panel { padding: 34px; background: #fff; }
-.connect-panel h2 { margin-bottom: 14px; font-size: 1.65rem; }
-.connect-panel p:not(.eyebrow) { color: var(--muted); line-height: 1.55; }
-.connect-panel form { display: grid; gap: 16px; }
-.connect-panel label, .task-editor label { display: grid; gap: 7px; color: var(--muted); font-size: .78rem; font-weight: 700; }
+.task-editor label { display: grid; gap: 7px; color: var(--muted); font-size: .78rem; font-weight: 700; }
 input, textarea { width: 100%; border: 1px solid var(--line-dark); border-radius: 5px; color: var(--ink); background: #fff; }
 input { height: 44px; padding: 0 12px; }
 textarea { resize: vertical; padding: 12px; line-height: 1.5; }
-.connect-panel .link-button, .connect-panel .secondary-button { width: 100%; margin-top: 10px; }
-.install-link { color: var(--muted); font-size: .78rem; text-underline-offset: 3px; }
 
 .board-page { min-height: 100vh; overflow: hidden; }
 .board-header { height: 64px; display: grid; grid-template-columns: 42px 1fr; align-items: center; gap: 14px; padding: 0 20px; border-bottom: 1px solid var(--line-dark); background: rgb(255 255 255 / 92%); backdrop-filter: blur(12px); }
@@ -326,8 +345,10 @@ textarea { resize: vertical; padding: 12px; line-height: 1.5; }
 @keyframes loading { from { transform: translateX(-100%); } to { transform: translateX(200%); } }
 
 @media (max-width: 900px) {
-  .index-grid { grid-template-columns: 1fr; }
-  .repository-list { border-right: 0; border-bottom: 1px solid var(--ink); }
+  .workflow-proof ol { grid-template-columns: 1fr; }
+  .workflow-proof li { min-height: auto; padding: 16px 20px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .workflow-proof li:last-child { border-bottom: 0; }
+  .workflow-proof li::after { top: auto; right: 22px; bottom: -7px; }
   .board-header { grid-template-columns: 40px minmax(0, 1fr); }
   .board-context { align-items: start; flex-direction: column; }
   .kanban { height: calc(100vh - 228px); grid-template-columns: repeat(5, 280px); }
@@ -339,10 +360,17 @@ textarea { resize: vertical; padding: 12px; line-height: 1.5; }
 @media (max-width: 620px) {
   .index-page { padding-inline: 20px; background-size: 56px 100%; }
   .index-header { height: 66px; }
-  .index-intro { padding: 72px 0 45px; }
-  .index-intro h1 { font-size: 3.25rem; }
+  .index-hero { padding: 54px 0 34px; }
+  .index-intro h1 { font-size: 3.15rem; }
+  .index-intro > p:last-child { margin-top: 20px; font-size: .98rem; }
+  .repository-launcher { margin-top: 26px; }
+  .launcher-control { grid-template-columns: 1fr; }
+  .launcher-control .primary-button { width: 100%; }
+  .launcher-meta { grid-template-columns: 1fr; min-height: 52px; }
+  .launcher-meta .field-error { text-align: left; }
+  .workflow-heading { align-items: start; }
+  .workflow-proof li { padding-inline: 16px; }
   .repository-list { padding-right: 0; }
-  .connect-panel { padding: 28px 22px; }
   .board-identity .wordmark { display: none; }
   .board-context { min-height: 104px; padding-inline: 16px; }
   .task-drawer { top: 0; width: 100%; border-left: 0; }

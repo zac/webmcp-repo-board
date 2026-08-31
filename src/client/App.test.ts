@@ -1,6 +1,23 @@
 import { describe, expect, it, vi } from "vitest";
 import type { BoardView, TaskView } from "../shared";
-import { codexPrompt, repositoryGateCopy, socketReconnectPolicy } from "./App";
+import { codexPrompt, parseRepositoryInput, repositoryGateCopy, socketReconnectPolicy } from "./App";
+
+describe("repository launcher", () => {
+  it("accepts owner/repository paths", () => {
+    expect(parseRepositoryInput("  acme/widgets  ")).toEqual({ owner: "acme", repo: "widgets" });
+  });
+
+  it("accepts GitHub URLs and strips clone suffixes", () => {
+    expect(parseRepositoryInput("https://github.com/acme/widgets.git")).toEqual({ owner: "acme", repo: "widgets" });
+    expect(parseRepositoryInput("github.com/acme/widgets/pulls")).toEqual({ owner: "acme", repo: "widgets" });
+  });
+
+  it("rejects incomplete paths and non-GitHub URLs", () => {
+    expect(parseRepositoryInput("widgets")).toBeNull();
+    expect(parseRepositoryInput("acme/widgets/issues")).toBeNull();
+    expect(parseRepositoryInput("https://example.com/acme/widgets")).toBeNull();
+  });
+});
 
 describe("realtime connection state", () => {
   it("treats planned authorization rotation as reconnecting instead of offline", () => {
