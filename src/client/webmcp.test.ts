@@ -94,7 +94,7 @@ function board(taskValue: TaskView, canMutate = true): BoardView {
   };
 }
 
-function handlers(boardValue: BoardView, selected = boardValue.tasks[0]?.id ?? null): BoardToolHandlers {
+function handlers(boardValue: BoardView, selected: string | null = boardValue.tasks[0]?.id ?? null): BoardToolHandlers {
   return {
     getBoard: () => boardValue,
     getSelectedTaskId: () => selected,
@@ -123,7 +123,38 @@ describe("dynamic WebMCP profiles", () => {
   });
 
   it("exposes claiming to authorized unassigned viewers", async () => {
-    expect(await namesFor(board(task("ready")))).toEqual(["list_tasks", "inspect_task", "cancel_task", "claim_task"]);
+    expect(await namesFor(board(task("ready")))).toEqual(["list_tasks", "inspect_task", "create_task", "cancel_task", "claim_task"]);
+  });
+
+  it("keeps task creation available when no task is selected", async () => {
+    const registry = new Registry();
+    const boardValue = board(task("in_pr"));
+    await registerBoardTools(registry, handlers(boardValue, null), new AbortController().signal);
+
+    expect([...registry.tools.keys()]).toEqual(["list_tasks", "inspect_task", "create_task", "claim_task"]);
+  });
+
+  it("creates an unassigned Todo task through every authorized profile", async () => {
+    const registry = new Registry();
+    const boardValue = board(task("in_progress", true));
+    const createdTask = { ...task("todo"), id: "task-created", reference: "silver-kite", title: "Follow up", description: "Deferred work" };
+    const nextBoard = { ...boardValue, revision: 4, tasks: [...boardValue.tasks, createdTask] };
+    const toolHandlers = handlers(boardValue);
+    toolHandlers.runCommand = vi.fn(async () => nextBoard);
+    await registerBoardTools(registry, toolHandlers, new AbortController().signal);
+
+    const result = await registry.tools.get("create_task")!.execute({ title: "Follow up", description: "Deferred work" });
+
+    expect(toolHandlers.runCommand).toHaveBeenCalledWith(
+      { type: "create_task", title: "Follow up", description: "Deferred work" },
+      expect.any(AbortSignal),
+    );
+    expect(JSON.parse(String(result))).toMatchObject({
+      status: "created",
+      revision: 4,
+      task: { id: "task-created", reference: "silver-kite", title: "Follow up", column: "todo", assignment: null },
+    });
+    expect(registry.tools.get("create_task")?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false, untrustedContentHint: true });
   });
 
   it("returns assignment conflicts as bounded structured tool results", async () => {
@@ -166,16 +197,16 @@ describe("dynamic WebMCP profiles", () => {
   });
 
   it.each([
-    ["todo", ["list_tasks", "inspect_task", "cancel_task", "report_progress", "release_task", "set_plan", "set_plan_and_start_work"]],
-    ["ready", ["list_tasks", "inspect_task", "cancel_task", "report_progress", "release_task", "read_plan", "update_plan", "start_work"]],
-    ["in_progress", ["list_tasks", "inspect_task", "cancel_task", "report_progress", "release_task", "read_plan", "link_pull_request"]],
-    ["in_pr", ["list_tasks", "inspect_task", "report_progress", "release_task", "read_pull_request", "read_review", "check_status"]],
+    ["todo", ["list_tasks", "inspect_task", "create_task", "cancel_task", "report_progress", "release_task", "set_plan", "set_plan_and_start_work"]],
+    ["ready", ["list_tasks", "inspect_task", "create_task", "cancel_task", "report_progress", "release_task", "read_plan", "update_plan", "start_work"]],
+    ["in_progress", ["list_tasks", "inspect_task", "create_task", "cancel_task", "report_progress", "release_task", "read_plan", "link_pull_request"]],
+    ["in_pr", ["list_tasks", "inspect_task", "create_task", "report_progress", "release_task", "read_pull_request", "read_review", "check_status"]],
   ] satisfies Array<[TaskColumn, string[]]>)("registers the exact %s assignment profile", async (column, expected) => {
     expect(await namesFor(board(task(column, true)))).toEqual(expected);
   });
 
   it("adds confirmed archival only for the selected Done task", async () => {
-    expect(await namesFor(board(task("done")))).toEqual(["list_tasks", "inspect_task", "claim_task", "archive_task"]);
+    expect(await namesFor(board(task("done")))).toEqual(["list_tasks", "inspect_task", "create_task", "claim_task", "archive_task"]);
   });
 
   it("removes every imperative tool when its profile signal aborts", async () => {
