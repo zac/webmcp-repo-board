@@ -69,13 +69,13 @@ Register tools through `document.modelContext`, with one `AbortController` per a
 | Context | Tools |
 |---|---|
 | Anonymous or read-only | `list_tasks`, `inspect_task` |
-| Authorized, unassigned | read tools plus `claim_task` |
+| Authorized, any state | read tools plus `create_task` and confirmed `archive_task`; archival accepts only completed Done work |
+| Authorized, unassigned | common authorized tools plus `claim_task` |
 | Selected task assigned to another tab | read tools plus confirmed `take_over_task` |
 | Assigned Todo | read tools plus `report_progress`, `set_plan`, `release_task` |
 | Assigned Ready | read tools plus `read_plan`, `update_plan`, `report_progress`, `start_work`, `release_task` |
 | Assigned In Progress | read tools plus `read_plan`, `report_progress`, `link_pull_request`, `release_task` |
 | Assigned In PR | read tools plus `read_pull_request`, `read_review`, `check_status`, `report_progress`, `release_task` |
-| Selected Done task | read tools plus confirmed `archive_task` |
 
 `list_tasks` and `inspect_task` are the only general read tools; assigned profiles reuse them rather than registering a parallel `read_task`. For an assigned agent, `inspect_task` additionally includes its own assignment, browser presence, and latest progress report.
 

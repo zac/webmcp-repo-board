@@ -128,6 +128,37 @@ export async function registerBoardTools(context: WebMcpContext, handlers: Board
         });
       },
     });
+
+    await add({
+      name: "archive_task",
+      title: "Archive a completed task",
+      description: "Archive an unarchived task only after it has reached Done. Use list_tasks to find the ticket reference. The page shows the task and requires human confirmation before hiding it from the default board. Its history remains queryable.",
+      inputSchema: {
+        type: "object", additionalProperties: false,
+        properties: {
+          taskRef: { type: "string", minLength: 3, maxLength: 32, description: "The two-word ticket reference, such as amber-fox." },
+          taskId: { type: "string", minLength: 1, maxLength: 100, description: "Legacy internal UUID. Prefer taskRef." },
+        },
+        anyOf: [{ required: ["taskRef"] }, { required: ["taskId"] }],
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, untrustedContentHint: true },
+      execute: async (input, execution) => {
+        const combined = toolSignal(execution, signal);
+        const requested = typeof input.taskRef === "string" ? input.taskRef : typeof input.taskId === "string" ? input.taskId : "";
+        const target = findTask(handlers.getBoard().tasks, requested) ?? await handlers.loadTask(requested, combined);
+        if (!target) return bounded({ status: "task_not_found", taskRef: requested });
+        if (target.column !== "done" || target.archivedAt !== null || target.resolution !== "completed" || target.resolvedAt === null) {
+          return bounded({
+            status: "task_not_archivable",
+            task: taskSummary(target),
+            next: "Only completed, unarchived Done tasks can be archived.",
+          });
+        }
+        await handlers.confirmArchive(target, combined);
+        const next = await handlers.runCommand({ type: "archive_task", taskId: target.id }, combined);
+        return bounded({ status: "archived", task: taskSummary(target), revision: next.revision });
+      },
+    });
   }
 
   const selected = board.tasks.find((task) => task.id === handlers.getSelectedTaskId());
@@ -253,21 +284,6 @@ export async function registerBoardTools(context: WebMcpContext, handlers: Board
       },
     });
 
-    if (selected?.column === "done" && selected.archivedAt === null) {
-      await add({
-        name: "archive_task",
-        title: "Archive the selected Done task",
-        description: "Ask the human to confirm hiding the selected Done task from the default board. History remains queryable.",
-        inputSchema: emptySchema(),
-        annotations: { readOnlyHint: false, destructiveHint: true, untrustedContentHint: false },
-        execute: async (_input, execution) => {
-          const combined = toolSignal(execution, signal);
-          await handlers.confirmArchive(selected, combined);
-          const next = await handlers.runCommand({ type: "archive_task", taskId: selected.id }, combined);
-          return bounded({ status: "archived", taskId: selected.id, revision: next.revision });
-        },
-      });
-    }
   }
   return names;
 }

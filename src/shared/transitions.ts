@@ -25,8 +25,13 @@ export function columnForPullRequest(snapshot: PullRequestSnapshot): Extract<Tas
   return "in_pr";
 }
 
-export function canArchive(column: TaskColumn, archivedAt: number | null): boolean {
-  return column === "done" && archivedAt === null;
+export function canArchive(
+  column: TaskColumn,
+  archivedAt: number | null,
+  resolution: "completed" | "canceled" | null,
+  resolvedAt: number | null,
+): boolean {
+  return column === "done" && archivedAt === null && resolution === "completed" && resolvedAt !== null;
 }
 
 export function canCancel(column: TaskColumn, archivedAt: number | null): boolean {

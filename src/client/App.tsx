@@ -58,7 +58,7 @@ const TOOL_COPY: Record<string, string> = {
   read_pull_request: "Read the linked pull request snapshot.",
   read_review: "Read bounded review decisions and recent review activity.",
   check_status: "Refresh pull request, checks, and review status from GitHub.",
-  archive_task: "Confirm and archive the selected completed task.",
+  archive_task: "Confirm and archive a completed Done task.",
 };
 
 interface ArchiveRequest {

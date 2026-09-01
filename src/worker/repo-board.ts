@@ -611,7 +611,9 @@ export class RepositoryBoard extends DurableObject<Env> {
       }
       case "archive_task": {
         const task = this.requireTask(command.taskId);
-        if (!canArchive(task.column_name, task.archived_at)) throw new BoardError("task_not_archivable", "Only an unarchived Done task can be archived", 409);
+        if (!canArchive(task.column_name, task.archived_at, task.resolution, task.resolved_at)) {
+          throw new BoardError("task_not_archivable", "Only completed, unarchived Done tasks can be archived", 409);
+        }
         this.ctx.storage.sql.exec("UPDATE tasks SET archived_at = ?, updated_at = ?, task_revision = ? WHERE id = ?", now, now, revision, task.id);
         return { type: "task_archived", taskId: task.id, data: { archived: true } };
       }

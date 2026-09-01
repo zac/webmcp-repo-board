@@ -51,9 +51,11 @@ describe("task transitions", () => {
   });
 
   it("archives only active Done tasks", () => {
-    expect(canArchive("done", null)).toBe(true);
-    expect(canArchive("done", 1)).toBe(false);
-    expect(canArchive("in_pr", null)).toBe(false);
+    expect(canArchive("done", null, "completed", 1)).toBe(true);
+    expect(canArchive("done", 1, "completed", 1)).toBe(false);
+    expect(canArchive("done", null, null, null)).toBe(false);
+    expect(canArchive("done", null, "canceled", 1)).toBe(false);
+    expect(canArchive("in_pr", null, null, null)).toBe(false);
   });
 
   it("cancels only active work before a pull request", () => {

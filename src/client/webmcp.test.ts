@@ -126,7 +126,7 @@ describe("dynamic WebMCP profiles", () => {
   });
 
   it("exposes claiming to authorized unassigned viewers", async () => {
-    expect(await namesFor(board(task("ready")))).toEqual(["list_tasks", "inspect_task", "create_task", "cancel_task", "claim_task"]);
+    expect(await namesFor(board(task("ready")))).toEqual(["list_tasks", "inspect_task", "create_task", "archive_task", "cancel_task", "claim_task"]);
   });
 
   it("maps natural-language planning requests to the Todo claim flow", async () => {
@@ -146,7 +146,7 @@ describe("dynamic WebMCP profiles", () => {
     const boardValue = board(task("in_pr"));
     await registerBoardTools(registry, handlers(boardValue, null), new AbortController().signal);
 
-    expect([...registry.tools.keys()]).toEqual(["list_tasks", "inspect_task", "create_task", "claim_task"]);
+    expect([...registry.tools.keys()]).toEqual(["list_tasks", "inspect_task", "create_task", "archive_task", "claim_task"]);
   });
 
   it("creates an unassigned Todo task through every authorized profile", async () => {
@@ -213,16 +213,16 @@ describe("dynamic WebMCP profiles", () => {
   });
 
   it.each([
-    ["todo", ["list_tasks", "inspect_task", "create_task", "cancel_task", "report_progress", "release_task", "set_plan", "set_plan_and_start_work"]],
-    ["ready", ["list_tasks", "inspect_task", "create_task", "cancel_task", "report_progress", "release_task", "read_plan", "update_plan", "start_work"]],
-    ["in_progress", ["list_tasks", "inspect_task", "create_task", "cancel_task", "report_progress", "release_task", "read_plan", "link_pull_request"]],
-    ["in_pr", ["list_tasks", "inspect_task", "create_task", "report_progress", "release_task", "read_pull_request", "read_review", "check_status"]],
+    ["todo", ["list_tasks", "inspect_task", "create_task", "archive_task", "cancel_task", "report_progress", "release_task", "set_plan", "set_plan_and_start_work"]],
+    ["ready", ["list_tasks", "inspect_task", "create_task", "archive_task", "cancel_task", "report_progress", "release_task", "read_plan", "update_plan", "start_work"]],
+    ["in_progress", ["list_tasks", "inspect_task", "create_task", "archive_task", "cancel_task", "report_progress", "release_task", "read_plan", "link_pull_request"]],
+    ["in_pr", ["list_tasks", "inspect_task", "create_task", "archive_task", "report_progress", "release_task", "read_pull_request", "read_review", "check_status"]],
   ] satisfies Array<[TaskColumn, string[]]>)("registers the exact %s assignment profile", async (column, expected) => {
     expect(await namesFor(board(task(column, true)))).toEqual(expected);
   });
 
-  it("adds confirmed archival only for the selected Done task", async () => {
-    expect(await namesFor(board(task("done")))).toEqual(["list_tasks", "inspect_task", "create_task", "claim_task", "archive_task"]);
+  it("keeps archival available for completed Done tasks without requiring card selection", async () => {
+    expect(await namesFor(board(task("done")))).toEqual(["list_tasks", "inspect_task", "create_task", "archive_task", "claim_task"]);
   });
 
   it("removes every imperative tool when its profile signal aborts", async () => {
@@ -239,9 +239,25 @@ describe("dynamic WebMCP profiles", () => {
     const boardValue = board(task("done"));
     const toolHandlers = handlers(boardValue);
     await registerBoardTools(registry, toolHandlers, new AbortController().signal);
-    await registry.tools.get("archive_task")!.execute({});
+    await registry.tools.get("archive_task")!.execute({ taskRef: "coral-wren" });
     expect(toolHandlers.confirmArchive).toHaveBeenCalledOnce();
     expect(toolHandlers.runCommand).toHaveBeenCalledWith({ type: "archive_task", taskId: "task-done" }, expect.any(AbortSignal));
+  });
+
+  it("refuses to archive work before Done without asking for confirmation", async () => {
+    const registry = new Registry();
+    const boardValue = board(task("in_progress"));
+    const toolHandlers = handlers(boardValue);
+    await registerBoardTools(registry, toolHandlers, new AbortController().signal);
+
+    const result = await registry.tools.get("archive_task")!.execute({ taskRef: "swift-moss" });
+
+    expect(JSON.parse(String(result))).toMatchObject({
+      status: "task_not_archivable",
+      task: { reference: "swift-moss", column: "in_progress" },
+    });
+    expect(toolHandlers.confirmArchive).not.toHaveBeenCalled();
+    expect(toolHandlers.runCommand).not.toHaveBeenCalled();
   });
 
   it("requires a human-confirmed reason before cancellation", async () => {
