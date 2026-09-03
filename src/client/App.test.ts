@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { BoardView, TaskView } from "../shared";
-import { codexPrompt, parseRepositoryInput, repositoryGateCopy, socketReconnectPolicy } from "./App";
+import { assignmentPresence, codexPrompt, parseRepositoryInput, repositoryGateCopy, repositorySettingsUrl, socketReconnectPolicy } from "./App";
 
 describe("repository launcher", () => {
   it("accepts owner/repository paths", () => {
@@ -19,10 +19,25 @@ describe("repository launcher", () => {
   });
 });
 
+describe("repository account links", () => {
+  it("opens the current repository settings page", () => {
+    expect(repositorySettingsUrl("https://github.com/acme/widgets/"))
+      .toBe("https://github.com/acme/widgets/settings");
+  });
+});
+
 describe("realtime connection state", () => {
   it("treats planned authorization rotation as reconnecting instead of offline", () => {
     expect(socketReconnectPolicy(4000)).toEqual({ status: "connecting", delay: 0 });
     expect(socketReconnectPolicy(1006)).toEqual({ status: "offline", delay: 1_500 });
+  });
+
+  it("uses compact agent presence labels", () => {
+    vi.setSystemTime(new Date("2026-09-03T05:30:00Z"));
+    const assignment = { connected: true, lastSeenAt: Date.parse("2026-09-03T03:45:00Z") } as NonNullable<TaskView["assignment"]>;
+    expect(assignmentPresence(assignment)).toBe("online");
+    expect(assignmentPresence({ ...assignment, connected: false })).toBe("away · 1h 45m");
+    vi.useRealTimers();
   });
 });
 

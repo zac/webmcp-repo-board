@@ -118,6 +118,7 @@ export function App(): ReactNode {
   const [archiveRequest, setArchiveRequest] = useState<ArchiveRequest | null>(null);
   const [cancelRequest, setCancelRequest] = useState<CancelRequest | null>(null);
   const [takeoverRequest, setTakeoverRequest] = useState<TakeoverRequest | null>(null);
+  const [signOutRequest, setSignOutRequest] = useState<TaskView | null>(null);
   const [archiveOpen, setArchiveOpen] = useState(false);
   const [archivedTasks, setArchivedTasks] = useState<TaskView[]>([]);
   const [registrationProfileKey, setRegistrationProfileKey] = useState("none");
@@ -399,7 +400,7 @@ export function App(): ReactNode {
   useEffect(() => {
     if (!board) return;
     const active = activeAssignmentId ? board.tasks.find((task) => task.assignment?.id === activeAssignmentId && task.assignment.isCurrentClient) : null;
-    if (activeAssignmentId && !active) setActiveAssignmentId(null);
+    if (activeAssignmentId && board.viewer.userId && !active) setActiveAssignmentId(null);
   }, [activeAssignmentId, board, setActiveAssignmentId]);
 
   useEffect(() => {
@@ -463,6 +464,29 @@ export function App(): ReactNode {
     setArchiveOpen(false);
     setArchivedTasks([]);
   }, [setCurrentBoard, setSelected]);
+
+  const finishSignOut = useCallback(async (releaseAssignmentId?: string) => {
+    setSignOutRequest(null);
+    try {
+      if (releaseAssignmentId) await runCommand({ type: "release_task", assignmentId: releaseAssignmentId });
+      await logout();
+      setUser(null);
+      await refreshDirectory();
+      await openFromLocation();
+      setToast(releaseAssignmentId ? "Assignment released and signed out" : "Signed out");
+    } catch (caught) {
+      setError(messageFor(caught));
+    }
+  }, [openFromLocation, refreshDirectory, runCommand]);
+
+  const requestSignOut = useCallback(() => {
+    const active = boardRef.current?.tasks.find((task) => task.assignment?.isCurrentClient) ?? null;
+    if (active) {
+      setSignOutRequest(active);
+      return;
+    }
+    void finishSignOut();
+  }, [finishSignOut]);
 
   const handleTaskSave = useCallback(async (values: { title: string; description: string }) => {
     if (taskEditor === null) return;
@@ -538,6 +562,7 @@ export function App(): ReactNode {
               .catch((caught) => setError(messageFor(caught))),
             reject: () => undefined,
           })}
+          onLogout={requestSignOut}
           onDevelopmentLogin={async () => {
             try { setUser(await createDevelopmentSession()); await refreshDirectory(); await openFromLocation(); }
             catch (caught) { setError(messageFor(caught)); }
@@ -549,6 +574,7 @@ export function App(): ReactNode {
           config={config}
           user={user}
           onBack={navigateHome}
+          onLogout={requestSignOut}
           onDevelopmentLogin={async () => {
             try { setUser(await createDevelopmentSession()); await refreshDirectory(); await openFromLocation(); }
             catch (caught) { setError(messageFor(caught)); }
@@ -564,7 +590,7 @@ export function App(): ReactNode {
             try { setUser(await createDevelopmentSession()); await refreshDirectory(); }
             catch (caught) { setError(messageFor(caught)); }
           }}
-          onLogout={async () => { await logout(); setUser(null); await refreshDirectory(); }}
+          onLogout={requestSignOut}
           onNavigate={navigateRepository}
         />
       )}
@@ -596,10 +622,66 @@ export function App(): ReactNode {
           onConfirm={(values) => { takeoverRequest.resolve(values); setTakeoverRequest(null); }}
         />
       )}
+      {signOutRequest && (
+        <SignOutDialog
+          task={signOutRequest}
+          onCancel={() => setSignOutRequest(null)}
+          onKeep={() => void finishSignOut()}
+          onRelease={() => void finishSignOut(signOutRequest.assignment!.id)}
+        />
+      )}
       {error && <Notice kind="error" onClose={() => setError(null)}>{error}</Notice>}
       {toast && <Notice kind="success" onClose={() => setToast(null)}>{toast}</Notice>}
     </div>
   );
+}
+
+function AccountMenu(props: {
+  user: SessionUser;
+  appAccessUrl?: string;
+  repositoryUrl?: string | null;
+  onLogout: () => void;
+  placement: "header" | "status";
+}): ReactNode {
+  const [open, setOpen] = useState(false);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const menuId = `account-menu-${props.placement}`;
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (!wrapperRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  return <div className={`account-menu ${props.placement}`} ref={wrapperRef}>
+    <button className="account-menu-trigger" onClick={() => setOpen((current) => !current)} aria-expanded={open} aria-controls={menuId}>
+      <span>@{props.user.login}</span>
+      <svg viewBox="0 0 14 9" aria-hidden="true"><path d="m2 2 5 5 5-5" /></svg>
+    </button>
+    {open && <section className="account-popover" id={menuId} aria-label="GitHub account menu">
+      <header>
+        {props.user.avatarUrl
+          ? <img src={props.user.avatarUrl} alt="" />
+          : <span className="account-avatar" aria-hidden="true">{props.user.login.slice(0, 1).toUpperCase()}</span>}
+        <span className="account-identity"><small>Signed in with GitHub</small><strong>@{props.user.login}</strong></span>
+      </header>
+      <nav aria-label="Account links">
+        {props.appAccessUrl && <a href={props.appAccessUrl} target="_blank" rel="noreferrer"><span>Manage Repo Board access</span><b aria-hidden="true">↗</b></a>}
+        {props.repositoryUrl && <a href={props.repositoryUrl} target="_blank" rel="noreferrer"><span>Repository settings</span><b aria-hidden="true">↗</b></a>}
+      </nav>
+      <button className="account-sign-out" onClick={() => { setOpen(false); props.onLogout(); }}>Sign out</button>
+    </section>}
+  </div>;
 }
 
 function BoardIndex(props: {
@@ -635,9 +717,7 @@ function BoardIndex(props: {
     <main className="index-page">
       <header className="index-header">
         <Wordmark />
-        <div className="session-control">
-          {props.user ? <><span className="user-chip">@{props.user.login}</span><button className="text-button" onClick={props.onLogout}>Sign out</button></> : null}
-        </div>
+        {props.user && <AccountMenu user={props.user} appAccessUrl={props.config?.githubInstallUrl} onLogout={props.onLogout} placement="header" />}
       </header>
       <section className="index-hero">
         <div className="index-intro">
@@ -724,11 +804,16 @@ export function parseRepositoryInput(value: string): { owner: string; repo: stri
   return { owner, repo };
 }
 
+export function repositorySettingsUrl(repositoryUrl: string): string {
+  return `${repositoryUrl.replace(/\/+$/, "")}/settings`;
+}
+
 function RepositoryGate(props: {
   route: { owner: string; repo: string };
   config: AppConfig | null;
   user: SessionUser | null;
   onBack: () => void;
+  onLogout: () => void;
   onDevelopmentLogin: () => void;
 }): ReactNode {
   const fullName = `${props.route.owner}/${props.route.repo}`;
@@ -738,7 +823,7 @@ function RepositoryGate(props: {
       <header className="board-header">
         <button className="back-button" onClick={props.onBack} aria-label="Back to repositories">←</button>
         <div className="board-identity"><Wordmark compact /><span className="identity-divider" /><span className="gate-repository">{fullName}</span></div>
-        {props.user && <span className="user-chip">Signed in as @{props.user.login}</span>}
+        {props.user && <AccountMenu user={props.user} appAccessUrl={props.config?.githubInstallUrl} onLogout={props.onLogout} placement="header" />}
       </header>
       <section className="board-context"><div><p className="eyebrow">Repository board</p><h1>{fullName}</h1></div></section>
       <section className="kanban gate-board" aria-hidden="true">
@@ -796,6 +881,7 @@ function BoardPage(props: {
   onRefreshPr: (taskId: string) => void;
   onArchive: (task: TaskView) => void;
   onCancelTask: (task: TaskView) => void;
+  onLogout: () => void;
   onDevelopmentLogin: () => void;
 }): ReactNode {
   const kanbanRef = useRef<HTMLElement>(null);
@@ -939,7 +1025,11 @@ function BoardPage(props: {
       <BoardStatus
         realtime={props.realtime}
         revision={props.board.revision}
-        viewerLogin={props.board.viewer.login}
+        user={props.user}
+        signInUrl={loginUrl(props.config)}
+        appAccessUrl={props.config?.githubInstallUrl}
+        repositoryUrl={props.board.viewer.roleName === "admin" ? repositorySettingsUrl(props.board.htmlUrl) : null}
+        onLogout={props.onLogout}
         toolNames={props.toolNames}
       />
       {selected && (
@@ -998,7 +1088,11 @@ function ColumnArchive(props: {
 function BoardStatus(props: {
   realtime: "connecting" | "live" | "offline" | "preview";
   revision: number;
-  viewerLogin: string | null;
+  user: SessionUser | null;
+  signInUrl: string;
+  appAccessUrl?: string;
+  repositoryUrl: string | null;
+  onLogout: () => void;
   toolNames: string[];
 }): ReactNode {
   const [open, setOpen] = useState(false);
@@ -1025,10 +1119,14 @@ function BoardStatus(props: {
 
   return (
     <footer className="board-status">
-      <div className="board-status-summary">
-        <span className={`live-state ${props.realtime}`}><i />{props.realtime}</span>
-        <span>Revision <strong>{props.revision}</strong></span>
-        <span>{props.viewerLogin ? `@${props.viewerLogin}` : "public read-only"}</span>
+      <div className="board-status-left">
+        <div className="board-status-summary">
+          <span className={`live-state ${props.realtime}`}><i />{props.realtime}</span>
+          <span>Revision <strong>{props.revision}</strong></span>
+        </div>
+        {props.user
+          ? <AccountMenu user={props.user} appAccessUrl={props.appAccessUrl} repositoryUrl={props.repositoryUrl} onLogout={props.onLogout} placement="status" />
+          : <span className="signed-out-controls"><span className="public-status">public read-only</span><a className="status-sign-in" href={props.signInUrl}>Sign in with GitHub</a></span>}
       </div>
       <div className="tool-status" ref={wrapperRef}>
         <button className="tool-status-button" onClick={() => setOpen((current) => !current)} aria-expanded={open} aria-controls="available-webmcp-tools" title={toolPreview}>
@@ -1062,10 +1160,10 @@ function TaskCard({ task, selected, active, example = false, viewer, onSelect, o
         </div>
         {task.pullRequest && <PullRequestCardStatus pullRequest={task.pullRequest} viewer={viewer} />}
         {task.assignment && (
-          <div className="agent-strip">
+          <div className={`agent-strip ${task.assignment.connected ? "online" : "away"}`}>
             <i aria-hidden="true" />
-            <span><b>{task.assignment.agentLabel}</b><small>{assignmentFocusLabel(task.assignment.focus)} · @{task.assignment.userLogin}</small></span>
-            <time>{assignmentPresence(task.assignment)}</time>
+            <span className="agent-identity"><b>{task.assignment.agentLabel}</b><small>{assignmentFocusLabel(task.assignment.focus)} · @{task.assignment.userLogin}</small></span>
+            <span className="agent-presence">{assignmentPresence(task.assignment)}</span>
           </div>
         )}
       </button>
@@ -1374,6 +1472,19 @@ function TakeoverDialog({ task, initialAgentLabel, initialReason, onCancel, onCo
   </form></div>;
 }
 
+function SignOutDialog({ task, onCancel, onKeep, onRelease }: { task: TaskView; onCancel: () => void; onKeep: () => void; onRelease: () => void }): ReactNode {
+  return <div className="modal-backdrop" role="presentation"><div className="modal sign-out-dialog" role="dialog" aria-modal="true" aria-labelledby="sign-out-title">
+    <p className="eyebrow">Active assignment</p>
+    <h2 id="sign-out-title">Sign out?</h2>
+    <p>This tab owns <strong>{task.reference}</strong>. Signing out without releasing it leaves the task assigned to @{task.assignment!.userLogin}.</p>
+    <div className="modal-actions sign-out-actions">
+      <button className="secondary-button" onClick={onCancel}>Cancel</button>
+      <button className="secondary-button" onClick={onKeep}>Sign out anyway</button>
+      <button className="primary-button" onClick={onRelease}>Release and sign out</button>
+    </div>
+  </div></div>;
+}
+
 function MarkdownText({ value }: { value: string }): ReactNode {
   const lines = value.split("\n");
   return <div className="markdown-text">{lines.map((line, index) => {
@@ -1449,11 +1560,20 @@ function shortPromptLabel(intent: CodexPromptIntent): string {
 }
 
 function formatTime(value: number): string { return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(value); }
-function assignmentPresence(assignment: NonNullable<TaskView["assignment"]>): string {
-  if (assignment.connected) return "connected";
-  if (!assignment.lastSeenAt) return "not connected";
+export function assignmentPresence(assignment: NonNullable<TaskView["assignment"]>): string {
+  if (assignment.connected) return "online";
+  if (!assignment.lastSeenAt) return "away";
   const minutes = Math.max(0, Math.floor((Date.now() - assignment.lastSeenAt) / 60_000));
-  return minutes < 1 ? "disconnected just now" : `disconnected ${minutes}m ago`;
+  if (minutes < 1) return "away · now";
+  if (minutes < 60) return `away · ${minutes}m`;
+  if (minutes < 1_440) {
+    const hours = Math.floor(minutes / 60);
+    const remainder = minutes % 60;
+    return `away · ${hours}h${remainder ? ` ${remainder}m` : ""}`;
+  }
+  const days = Math.floor(minutes / 1_440);
+  const hours = Math.floor((minutes % 1_440) / 60);
+  return `away · ${days}d${hours ? ` ${hours}h` : ""}`;
 }
 function statLabel(key: string): string { return ({ filesChanged: "files", commits: "commits", testsPassed: "passed", testsFailed: "failed" } as Record<string, string>)[key] ?? key; }
 function eventName(value: string): string { return value.replaceAll("_", " "); }
